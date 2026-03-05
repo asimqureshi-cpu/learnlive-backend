@@ -13,21 +13,25 @@ const { initWebSocket } = require('./services/websocket');
 const app = express();
 const server = http.createServer(app);
 
-app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+// Open CORS for MVP
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+app.options('*', cors());
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// Routes
 app.use('/api/sessions', sessionRoutes);
 app.use('/api/materials', materialsRoutes);
 app.use('/api/scoring', scoringRoutes);
 app.use('/api/reports', reportsRoutes);
 app.use('/api/livekit', livekitRoutes);
 
-// WebSocket for real-time dashboard updates
 initWebSocket(server);
 
 const PORT = process.env.PORT || 3001;
