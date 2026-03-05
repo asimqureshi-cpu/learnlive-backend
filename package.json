@@ -10,7 +10,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.24.0",
     "@deepgram/sdk": "^3.3.0",
-    "@livekit/server-sdk": "^2.3.0",
+    "livekit-server-sdk": "^2.15.0",
     "@supabase/supabase-js": "^2.43.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
