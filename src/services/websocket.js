@@ -4,59 +4,44 @@ let wss;
 const sessionClients = new Map();
 
 function initWebSocket(server) {
-  wss = new WebSocketServer({ server, noServer: true });
+  wss = new WebSocketServer({ server, path: '/ws' });
 
-  server.on('upgrade', (request, socket, head) => {
-    const url = new URL(request.url, 'http://localhost');
-    
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      const sessionId = url.searchParams.get('sessionId');
-      const role = url.searchParams.get('role');
-      const participantName = url.searchParams.get('participantName');
-      const isAudio = url.pathname === '/ws/audio';
+  wss.on('connection', (ws, req) => {
+    const url = new URL(req.url, 'http://localhost');
+    const sessionId = url.searchParams.get('sessionId');
+    const role = url.searchParams.get('role');
+    const participantName = url.searchParams.get('participantName');
+    const type = url.searchParams.get('type');
 
-      ws._sessionId = sessionId;
-      ws._role = role;
-      ws._participantName = participantName;
-      ws._isAudio = isAudio;
+    ws._sessionId = sessionId;
+    ws._role = role;
+    ws._participantName = participantName;
+    ws._type = type;
 
-      if (isAudio) {
-        // Audio streaming from participant browser to Deepgram
-        ws.on('message', async (audioChunk) => {
-          if (sessionId) {
-            const { sendAudioChunk } = require('./transcription');
-            sendAudioChunk(sessionId, audioChunk);
-          }
-        });
-
-        ws.on('close', () => {
-          console.log(`[Audio] Stream closed for ${participantName}`);
-        });
-
-        ws.on('error', (err) => {
-          console.error('[Audio] WebSocket error:', err.message);
-        });
-
-        ws.send(JSON.stringify({ event: 'AUDIO_CONNECTED', data: { sessionId } }));
-
-      } else {
-        // Dashboard control WebSocket
+    if (type === 'audio') {
+      ws.on('message', (audioChunk) => {
         if (sessionId) {
-          if (!sessionClients.has(sessionId)) {
-            sessionClients.set(sessionId, new Set());
-          }
-          sessionClients.get(sessionId).add(ws);
+          const { sendAudioChunk } = require('./transcription');
+          sendAudioChunk(sessionId, audioChunk);
         }
+      });
+      ws.on('close', () => console.log(`[Audio] Stream closed for ${participantName}`));
+      ws.on('error', (e) => console.error('[Audio] Error:', e.message));
+      ws.send(JSON.stringify({ event: 'AUDIO_CONNECTED' }));
+      return;
+    }
 
-        ws.on('close', () => {
-          if (ws._sessionId && sessionClients.has(ws._sessionId)) {
-            sessionClients.get(ws._sessionId).delete(ws);
-          }
-        });
+    if (sessionId) {
+      if (!sessionClients.has(sessionId)) sessionClients.set(sessionId, new Set());
+      sessionClients.get(sessionId).add(ws);
+    }
 
-        ws.on('error', console.error);
+    ws.on('close', () => {
+      if (ws._sessionId && sessionClients.has(ws._sessionId)) {
+        sessionClients.get(ws._sessionId).delete(ws);
       }
     });
+    ws.on('error', console.error);
   });
 
   console.log('WebSocket server initialised');
@@ -65,37 +50,23 @@ function initWebSocket(server) {
 function broadcastToSession(sessionId, event, data) {
   if (!sessionClients.has(sessionId)) return;
   const message = JSON.stringify({ event, data, timestamp: new Date().toISOString() });
-  sessionClients.get(sessionId).forEach(client => {
-    if (client.readyState === 1) client.send(message);
-  });
+  sessionClients.get(sessionId).forEach(c => { if (c.readyState === 1) c.send(message); });
 }
 
 function broadcastToAdmins(sessionId, event, data) {
   if (!sessionClients.has(sessionId)) return;
   const message = JSON.stringify({ event, data, timestamp: new Date().toISOString() });
-  sessionClients.get(sessionId).forEach(client => {
-    if (client.readyState === 1 && client._role === 'admin') client.send(message);
+  sessionClients.get(sessionId).forEach(c => {
+    if (c.readyState === 1 && c._role === 'admin') c.send(message);
   });
 }
 
 function sendToParticipant(sessionId, participantName, event, data) {
   if (!sessionClients.has(sessionId)) return;
   const message = JSON.stringify({ event, data, timestamp: new Date().toISOString() });
-  sessionClients.get(sessionId).forEach(client => {
-    if (client.readyState === 1 && client._participantName === participantName) client.send(message);
+  sessionClients.get(sessionId).forEach(c => {
+    if (c.readyState === 1 && c._participantName === participantName) c.send(message);
   });
 }
 
 module.exports = { initWebSocket, broadcastToSession, broadcastToAdmins, sendToParticipant };
-```
-
-Commit → wait for Railway green → then:
-
-1. Create a fresh session
-2. Upload a PDF
-3. Start the session
-4. Join in incognito → allow microphone → speak for 60 seconds
-5. Check Railway Deploy Logs — you should now see:
-```
-[Audio] Stream closed for [name]
-[Deepgram] Transcript received: ...
