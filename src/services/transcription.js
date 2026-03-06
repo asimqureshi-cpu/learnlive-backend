@@ -17,12 +17,17 @@ function openDeepgramConnection(sessionId, topic) {
   console.log('[Deepgram] Opening connection for session', sessionId);
 
   const connection = deepgram.listen.live({
-    model: 'nova-2',
-    language: 'en',
-    smart_format: true,
-    interim_results: false,
-    endpointing: 300,
-  });
+  model: 'nova-2',
+  language: 'en',
+  smart_format: true,
+  interim_results: true,
+  punctuate: true,
+  encoding: 'opus',
+  container: 'webm',
+  sample_rate: 48000,
+  channels: 1,
+  endpointing: 500,
+});
 
   const sessionData = {
     connection,
