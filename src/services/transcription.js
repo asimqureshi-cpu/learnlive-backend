@@ -4,18 +4,16 @@ const supabase = require('./supabase');
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
-// sessionId -> { topic, connection, keepAliveInterval, participantStats, recentTranscript }
 const activeSessions = new Map();
-// sessionId -> { topic } — sessions registered but waiting for first audio chunk
 const pendingSessions = new Map();
 
 function registerSession(sessionId, topic) {
-  console.log('[Transcription] Session registered, waiting for audio:', sessionId);
+  console.log('[Transcription] Registered session waiting for audio:', sessionId);
   pendingSessions.set(sessionId, { topic });
 }
 
 function openDeepgramConnection(sessionId, topic) {
-  if (activeSessions.has(sessionId)) return activeSessions.get(sessionId);
+  if (activeSessions.has(sessionId)) return;
   console.log('[Deepgram] Opening connection for session', sessionId);
 
   const connection = deepgram.listen.live({
@@ -37,21 +35,18 @@ function openDeepgramConnection(sessionId, topic) {
   activeSessions.set(sessionId, sessionData);
 
   connection.on(LiveTranscriptionEvents.Open, () => {
-    console.log('[Deepgram] Connection open for session', sessionId);
-    // Send keepAlive every 8 seconds to prevent 10s timeout
+    console.log('[Deepgram] Connection OPEN for session', sessionId);
     sessionData.keepAliveInterval = setInterval(() => {
-      try {
-        connection.keepAlive();
-      } catch (e) {}
+      try { connection.keepAlive(); } catch (e) {}
     }, 8000);
   });
 
   connection.on(LiveTranscriptionEvents.Transcript, async (data) => {
-    const alt = data?.channel?.alternatives?.[0];
+    const alt = data && data.channel && data.channel.alternatives && data.channel.alternatives[0];
     if (!alt || !alt.transcript || alt.transcript.trim() === '') return;
 
     const utterance = alt.transcript.trim();
-    const speakerIdx = data?.channel?.alternatives?.[0]?.words?.[0]?.speaker ?? 0;
+    const speakerIdx = (alt.words && alt.words[0] && alt.words[0].speaker) ? alt.words[0].speaker : 0;
     const speakerTag = 'Speaker ' + (speakerIdx + 1);
 
     console.log('[Deepgram] Transcript:', speakerTag, '-', utterance);
@@ -59,7 +54,7 @@ function openDeepgramConnection(sessionId, topic) {
     await supabase.from('transcripts').insert({
       session_id: sessionId,
       speaker_name: speakerTag,
-      utterance,
+      utterance: utterance,
       timestamp_seconds: 0,
     });
 
@@ -73,44 +68,42 @@ function openDeepgramConnection(sessionId, topic) {
     if (sessionData.recentTranscript.length > 10) sessionData.recentTranscript.shift();
 
     broadcastToAdmins(sessionId, 'NEW_UTTERANCE', {
-      speakerTag,
-      utterance,
+      speakerTag: speakerTag,
+      utterance: utterance,
       timestamp: new Date().toISOString(),
     });
 
     scoreAndBroadcast(sessionId, sessionData, speakerTag, utterance);
   });
 
-  connection.on(LiveTranscriptionEvents.Error, (err) => {
-    console.error('[Deepgram] Error for session', sessionId, ':', err.message || err);
+  connection.on(LiveTranscriptionEvents.Error, function(err) {
+    console.error('[Deepgram] Error:', JSON.stringify(err));
   });
 
-  connection.on(LiveTranscriptionEvents.Close, () => {
-    console.log('[Deepgram] Connection closed for session', sessionId);
+  connection.on(LiveTranscriptionEvents.Close, function() {
+    console.log('[Deepgram] Connection CLOSED for session', sessionId);
     if (sessionData.keepAliveInterval) clearInterval(sessionData.keepAliveInterval);
     activeSessions.delete(sessionId);
   });
-
-  return sessionData;
 }
 
 function sendAudioChunk(sessionId, audioChunk) {
-  // If this is the first audio, open Deepgram connection now
   if (!activeSessions.has(sessionId)) {
-    const pending = pendingSessions.get(sessionId);
+    var pending = pendingSessions.get(sessionId);
     if (!pending) {
-      console.log('[Deepgram] No session registered for', sessionId);
+      console.log('[Deepgram] No registered session for', sessionId);
       return;
     }
     pendingSessions.delete(sessionId);
     openDeepgramConnection(sessionId, pending.topic);
   }
 
-  const session = activeSessions.get(sessionId);
+  var session = activeSessions.get(sessionId);
   if (!session) return;
 
   try {
-    const state = session.connection.getReadyState();
+    var state = session.connection.getReadyState();
+    console.log('[Deepgram] Ready state:', state, 'for session', sessionId);
     if (state === 1) {
       session.connection.send(audioChunk);
     }
@@ -121,19 +114,19 @@ function sendAudioChunk(sessionId, audioChunk) {
 
 async function scoreAndBroadcast(sessionId, sessionData, speakerTag, utterance) {
   try {
-    const { scoreUtterance } = require('./scoring');
-    const result = await scoreUtterance({
-      sessionId,
+    var scoring = require('./scoring');
+    var result = await scoring.scoreUtterance({
+      sessionId: sessionId,
       topic: sessionData.topic,
       speakerName: speakerTag,
-      utterance,
+      utterance: utterance,
       conversationContext: sessionData.recentTranscript.join('\n'),
     });
 
     await updateParticipantScore(sessionId, speakerTag, result, sessionData.participantStats[speakerTag]);
 
     broadcastToAdmins(sessionId, 'SCORE_UPDATE', {
-      speakerTag,
+      speakerTag: speakerTag,
       scores: result,
       participationStats: sessionData.participantStats[speakerTag],
     });
@@ -153,19 +146,18 @@ async function scoreAndBroadcast(sessionId, sessionData, speakerTag, utterance) 
 
 async function updateParticipantScore(sessionId, speakerTag, scoreResult, participationStats) {
   try {
-    const overall = (scoreResult.topic_adherence + scoreResult.depth + scoreResult.material_application * 1.5) / 3.5;
-    const { data: existing } = await supabase
-      .from('scores').select('*').eq('session_id', sessionId).eq('speaker_tag', speakerTag).single();
+    var overall = (scoreResult.topic_adherence + scoreResult.depth + scoreResult.material_application * 1.5) / 3.5;
+    var existing = await supabase.from('scores').select('*').eq('session_id', sessionId).eq('speaker_tag', speakerTag).single();
 
-    if (existing) {
-      const avg = (o, n) => Math.round((o * 0.7 + n * 0.3) * 10) / 10;
+    if (existing.data) {
+      var avg = function(o, n) { return Math.round((o * 0.7 + n * 0.3) * 10) / 10; };
       await supabase.from('scores').update({
-        topic_adherence_score: avg(existing.topic_adherence_score, scoreResult.topic_adherence),
-        depth_score: avg(existing.depth_score, scoreResult.depth),
-        material_application_score: avg(existing.material_application_score, scoreResult.material_application),
-        overall_score: avg(existing.overall_score, overall),
+        topic_adherence_score: avg(existing.data.topic_adherence_score, scoreResult.topic_adherence),
+        depth_score: avg(existing.data.depth_score, scoreResult.depth),
+        material_application_score: avg(existing.data.material_application_score, scoreResult.material_application),
+        overall_score: avg(existing.data.overall_score, overall),
         updated_at: new Date().toISOString(),
-      }).eq('id', existing.id);
+      }).eq('id', existing.data.id);
     } else {
       await supabase.from('scores').insert({
         session_id: sessionId,
@@ -189,6 +181,17 @@ async function startTranscription(sessionId, topic) {
 
 async function stopTranscription(sessionId) {
   pendingSessions.delete(sessionId);
-  const session = activeSessions.get(sessionId);
+  var session = activeSessions.get(sessionId);
   if (session) {
-    if (session.keepAliveInterval) clearInterval(
+    if (session.keepAliveInterval) clearInterval(session.keepAliveInterval);
+    try { session.connection.finish(); } catch (e) {}
+    activeSessions.delete(sessionId);
+  }
+}
+
+function getSessionStats(sessionId) {
+  var s = activeSessions.get(sessionId);
+  return s ? s.participantStats : {};
+}
+
+module.exports = { startTranscription, sendAudioChunk, stopTranscription, getSessionStats };
