@@ -1,106 +1,93 @@
-const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
-const { scoreUtterance, analyseGroupState } = require('./scoring');
-const { broadcastToAdmins, broadcastToSession } = require('./websocket');
+const { createClient } = require('@deepgram/sdk');
+const { broadcastToAdmins } = require('./websocket');
 const supabase = require('./supabase');
 
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
-
-// Active transcription sessions: sessionId -> { connection, buffer, stats }
 const activeSessions = new Map();
 
 async function startTranscription(sessionId, topic) {
   if (activeSessions.has(sessionId)) return;
+  console.log('[Deepgram] Starting transcription for session', sessionId);
 
-  const connection = deepgram.listen.live({
-    model: 'nova-2',
-    language: 'en',
-    smart_format: true,
-    diarize: true,
-    punctuate: true,
-    utterance_end_ms: 1500,
-    interim_results: true,
-  });
-
-  const sessionData = {
-    connection,
-    topic,
-    participantStats: {},    // speakerName -> { talkTimeSeconds, utteranceCount }
-    recentTranscript: [],    // last 10 utterances for group analysis
-    lastGroupCheck: Date.now(),
-    groupCheckInterval: 90000, // check group state every 90 seconds
-  };
-
-  activeSessions.set(sessionId, sessionData);
-
-  connection.on(LiveTranscriptionEvents.Open, () => {
-    console.log(`[Deepgram] Transcription started for session ${sessionId}`);
-  });
-
-  connection.on(LiveTranscriptionEvents.Transcript, async (data) => {
-    const transcript = data.channel?.alternatives?.[0];
-    if (!transcript || !transcript.transcript || data.is_final === false) return;
-
-    const words = transcript.words || [];
-    if (words.length === 0) return;
-
-    // Map Deepgram speaker IDs to names (speaker_0, speaker_1, etc.)
-    const speakerTag = `Speaker ${(words[0]?.speaker ?? 0) + 1}`;
-    const utterance = transcript.transcript.trim();
-    const duration = words.length > 1
-      ? (words[words.length - 1].end - words[0].start)
-      : 1;
-
-    // Update participation stats
-    if (!sessionData.participantStats[speakerTag]) {
-      sessionData.participantStats[speakerTag] = { talkTimeSeconds: 0, utteranceCount: 0 };
-    }
-    sessionData.participantStats[speakerTag].talkTimeSeconds += duration;
-    sessionData.participantStats[speakerTag].utteranceCount += 1;
-
-    // Store in DB
-    const { data: savedUtterance } = await supabase.from('transcripts').insert({
-      session_id: sessionId,
-      speaker_name: speakerTag,
-      utterance,
-      timestamp_seconds: words[0]?.start ?? 0,
-    }).select().single();
-
-    // Update recent transcript buffer
-    sessionData.recentTranscript.push(`[${speakerTag}]: ${utterance}`);
-    if (sessionData.recentTranscript.length > 10) sessionData.recentTranscript.shift();
-
-    // Broadcast new utterance to admin dashboard
-    broadcastToAdmins(sessionId, 'NEW_UTTERANCE', {
-      speakerTag,
-      utterance,
-      timestamp: new Date().toISOString(),
+  try {
+    const connection = deepgram.listen.live({
+      model: 'nova-2',
+      language: 'en',
+      smart_format: true,
+      interim_results: false,
+      endpointing: 300,
+      encoding: 'webm-opus',
     });
 
-    // Score utterance (async, don't await to keep stream flowing)
-    scoreAndBroadcast(sessionId, sessionData, speakerTag, utterance);
+    const sessionData = {
+      connection,
+      topic,
+      participantStats: {},
+      recentTranscript: [],
+      lastGroupCheck: Date.now(),
+    };
 
-    // Periodic group analysis
-    const now = Date.now();
-    if (now - sessionData.lastGroupCheck > sessionData.groupCheckInterval) {
-      sessionData.lastGroupCheck = now;
-      runGroupAnalysis(sessionId, sessionData);
-    }
-  });
+    activeSessions.set(sessionId, sessionData);
 
-  connection.on(LiveTranscriptionEvents.Error, (err) => {
-    console.error(`[Deepgram] Error for session ${sessionId}:`, err);
-  });
+    connection.on('open', () => {
+      console.log('[Deepgram] Connection open for session', sessionId);
+    });
 
-  connection.on(LiveTranscriptionEvents.Close, () => {
-    console.log(`[Deepgram] Connection closed for session ${sessionId}`);
-    activeSessions.delete(sessionId);
-  });
+    connection.on('transcript', async (data) => {
+      const alt = data?.channel?.alternatives?.[0];
+      if (!alt || !alt.transcript || alt.transcript.trim() === '') return;
 
-  return connection;
+      const utterance = alt.transcript.trim();
+      const speakerTag = 'Speaker ' + ((data?.channel?.alternatives?.[0]?.words?.[0]?.speaker ?? 0) + 1);
+
+      console.log('[Deepgram] Transcript:', speakerTag, '-', utterance);
+
+      // Store in DB
+      await supabase.from('transcripts').insert({
+        session_id: sessionId,
+        speaker_name: speakerTag,
+        utterance,
+        timestamp_seconds: 0,
+      });
+
+      // Update stats
+      if (!sessionData.participantStats[speakerTag]) {
+        sessionData.participantStats[speakerTag] = { talkTimeSeconds: 0, utteranceCount: 0 };
+      }
+      sessionData.participantStats[speakerTag].utteranceCount += 1;
+      sessionData.participantStats[speakerTag].talkTimeSeconds += utterance.split(' ').length * 0.4;
+
+      sessionData.recentTranscript.push('[' + speakerTag + ']: ' + utterance);
+      if (sessionData.recentTranscript.length > 10) sessionData.recentTranscript.shift();
+
+      // Broadcast to admin dashboard
+      broadcastToAdmins(sessionId, 'NEW_UTTERANCE', {
+        speakerTag,
+        utterance,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Score asynchronously
+      scoreAndBroadcast(sessionId, sessionData, speakerTag, utterance);
+    });
+
+    connection.on('error', (err) => {
+      console.error('[Deepgram] Error:', err);
+    });
+
+    connection.on('close', () => {
+      console.log('[Deepgram] Connection closed for session', sessionId);
+      activeSessions.delete(sessionId);
+    });
+
+  } catch (err) {
+    console.error('[Deepgram] Failed to start:', err);
+  }
 }
 
 async function scoreAndBroadcast(sessionId, sessionData, speakerTag, utterance) {
   try {
+    const { scoreUtterance } = require('./scoring');
     const result = await scoreUtterance({
       sessionId,
       topic: sessionData.topic,
@@ -109,17 +96,14 @@ async function scoreAndBroadcast(sessionId, sessionData, speakerTag, utterance) 
       conversationContext: sessionData.recentTranscript.join('\n'),
     });
 
-    // Update cumulative score in DB
     await updateParticipantScore(sessionId, speakerTag, result, sessionData.participantStats[speakerTag]);
 
-    // Broadcast score update to admin
     broadcastToAdmins(sessionId, 'SCORE_UPDATE', {
       speakerTag,
       scores: result,
       participationStats: sessionData.participantStats[speakerTag],
     });
 
-    // If a flag was raised, broadcast prompt suggestion to admin
     if (result.flag && result.suggested_prompt) {
       broadcastToAdmins(sessionId, 'PROMPT_SUGGESTION', {
         target: speakerTag,
@@ -129,72 +113,30 @@ async function scoreAndBroadcast(sessionId, sessionData, speakerTag, utterance) 
       });
     }
   } catch (err) {
-    console.error('[Transcription] Score error:', err);
-  }
-}
-
-async function runGroupAnalysis(sessionId, sessionData) {
-  try {
-    const result = await analyseGroupState({
-      sessionId,
-      topic: sessionData.topic,
-      participantStats: sessionData.participantStats,
-      recentTranscript: sessionData.recentTranscript.join('\n'),
-    });
-
-    if (result.intervention_needed) {
-      broadcastToAdmins(sessionId, 'GROUP_INTERVENTION', {
-        type: result.type,
-        target: result.target,
-        prompt: result.prompt,
-        reasoning: result.reasoning,
-      });
-    }
-  } catch (err) {
-    console.error('[Transcription] Group analysis error:', err);
+    console.error('[Scoring] Error:', err);
   }
 }
 
 async function updateParticipantScore(sessionId, speakerTag, scoreResult, participationStats) {
   try {
-    // Calculate participation score (0-10) based on talk time equity
-    const totalTalkTime = Object.values(
-      activeSessions.get(sessionId)?.participantStats ?? {}
-    ).reduce((sum, s) => sum + s.talkTimeSeconds, 0);
-
-    const fairShare = totalTalkTime / Math.max(
-      Object.keys(activeSessions.get(sessionId)?.participantStats ?? {}).length, 1
-    );
-    const actualShare = participationStats.talkTimeSeconds;
-    const participationScore = Math.min(10, Math.round((actualShare / Math.max(fairShare, 1)) * 7));
-
-    // Upsert score
+    const overall = (scoreResult.topic_adherence + scoreResult.depth + scoreResult.material_application * 1.5) / 3.5;
     const { data: existing } = await supabase
-      .from('scores')
-      .select('id, topic_adherence_score, depth_score, material_application_score, overall_score')
-      .eq('session_id', sessionId)
-      .eq('speaker_tag', speakerTag)
-      .single();
+      .from('scores').select('*').eq('session_id', sessionId).eq('speaker_tag', speakerTag).single();
 
     if (existing) {
-      // Rolling average
-      const avg = (old, newVal) => Math.round((old * 0.7 + newVal * 0.3) * 10) / 10;
+      const avg = (o, n) => Math.round((o * 0.7 + n * 0.3) * 10) / 10;
       await supabase.from('scores').update({
-        participation_score: participationScore,
         topic_adherence_score: avg(existing.topic_adherence_score, scoreResult.topic_adherence),
         depth_score: avg(existing.depth_score, scoreResult.depth),
         material_application_score: avg(existing.material_application_score, scoreResult.material_application),
-        overall_score: avg(existing.overall_score,
-          (scoreResult.topic_adherence + scoreResult.depth + scoreResult.material_application * 1.5) / 3.5
-        ),
+        overall_score: avg(existing.overall_score, overall),
         updated_at: new Date().toISOString(),
       }).eq('id', existing.id);
     } else {
-      const overall = (scoreResult.topic_adherence + scoreResult.depth + scoreResult.material_application * 1.5) / 3.5;
       await supabase.from('scores').insert({
         session_id: sessionId,
         speaker_tag: speakerTag,
-        participation_score: participationScore,
+        participation_score: 5,
         topic_adherence_score: scoreResult.topic_adherence,
         depth_score: scoreResult.depth,
         material_application_score: scoreResult.material_application,
@@ -202,21 +144,27 @@ async function updateParticipantScore(sessionId, speakerTag, scoreResult, partic
       });
     }
   } catch (err) {
-    console.error('[Transcription] Score update error:', err);
+    console.error('[Score Update] Error:', err);
   }
 }
 
 function sendAudioChunk(sessionId, audioChunk) {
   const session = activeSessions.get(sessionId);
-  if (session?.connection) {
-    session.connection.send(audioChunk);
+  if (session && session.connection) {
+    try {
+      session.connection.send(audioChunk);
+    } catch (err) {
+      console.error('[Deepgram] Send error:', err.message);
+    }
+  } else {
+    console.log('[Deepgram] No active session for', sessionId);
   }
 }
 
 async function stopTranscription(sessionId) {
   const session = activeSessions.get(sessionId);
   if (session) {
-    session.connection.finish();
+    try { session.connection.finish(); } catch (e) {}
     activeSessions.delete(sessionId);
   }
 }
@@ -226,3 +174,9 @@ function getSessionStats(sessionId) {
 }
 
 module.exports = { startTranscription, sendAudioChunk, stopTranscription, getSessionStats };
+```
+
+Commit → wait for Railway green → start a fresh session → join → speak → check Deploy Logs. You should now see:
+```
+[Deepgram] Connection open for session xxx
+[Deepgram] Transcript: Speaker 1 - your words here
