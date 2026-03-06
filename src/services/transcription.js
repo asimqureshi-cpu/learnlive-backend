@@ -16,7 +16,6 @@ async function startTranscription(sessionId, topic) {
       smart_format: true,
       interim_results: false,
       endpointing: 300,
-      encoding: 'webm-opus',
     });
 
     const sessionData = {
