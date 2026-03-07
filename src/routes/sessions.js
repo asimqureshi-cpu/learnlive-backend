@@ -177,4 +177,27 @@ router.post('/:id/prompt', async (req, res) => {
   }
 });
 
+// Delete a session
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Delete related data first
+    await Promise.all([
+      supabase.from('transcripts').delete().eq('session_id', id),
+      supabase.from('scores').delete().eq('session_id', id),
+      supabase.from('prompts_log').delete().eq('session_id', id),
+      supabase.from('document_chunks').delete().eq('session_id', id),
+    ]);
+    // Delete materials from storage
+    const { data: materials } = await supabase.from('materials').select('file_path').eq('session_id', id);
+    if (materials?.length) {
+      await supabase.storage.from('session-materials').remove(materials.map(m => m.file_path));
+    }
+    await supabase.from('materials').delete().eq('session_id', id);
+    await supabase.from('sessions').delete().eq('id', id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 module.exports = router;
