@@ -73,12 +73,6 @@ async function retrieveRelevantChunks(sessionId, query, topK = 5) {
     const queryEmbedding = await embedText(query);
 
     // Fetch all chunks for session (for MVP scale this is fine; replace with pgvector for scale)
-    const { data: chunks, error } = await supabase
-      .from('document_chunks')
-      .select('chunk_text, file_name, chunk_index')
-      .eq('session_id', sessionId);
-
-    if (error || !chunks || chunks.length === 0) return [];
 
     // Cosine similarity
     function cosineSim(a, b) {
@@ -104,7 +98,11 @@ async function retrieveRelevantChunks(sessionId, query, topK = 5) {
     }));
 
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, topK).map(c => ({
+    const MIN_SIMILARITY = 0.3;
+return scored
+  .filter(c => c.score >= MIN_SIMILARITY)
+  .slice(0, topK)
+  .map(c => ({
       text: c.chunk_text,
       fileName: c.file_name,
       relevanceScore: c.score,
