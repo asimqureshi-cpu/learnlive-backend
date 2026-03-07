@@ -10,7 +10,7 @@ function initWebSocket(server) {
     const url = new URL(req.url, 'http://localhost');
     const sessionId = url.searchParams.get('sessionId');
     const role = url.searchParams.get('role');
-    const participantName = url.searchParams.get('participantName');
+    const participantName = url.searchParams.get('participantName') || url.searchParams.get('participant') || 'unknown';
     const type = url.searchParams.get('type');
 
     ws._sessionId = sessionId;
@@ -20,11 +20,11 @@ function initWebSocket(server) {
 
     if (type === 'audio') {
       ws.on('message', (audioChunk) => {
-        if (sessionId) {
-          const { sendAudioChunk } = require('./transcription');
-          sendAudioChunk(sessionId, audioChunk);
-        }
-      });
+  if (sessionId) {
+    const { sendAudioChunk } = require('./transcription');
+    sendAudioChunk(sessionId, audioChunk, participantName);
+  }
+});
       ws.on('close', () => console.log(`[Audio] Stream closed for ${participantName}`));
       ws.on('error', (e) => console.error('[Audio] Error:', e.message));
       ws.send(JSON.stringify({ event: 'AUDIO_CONNECTED' }));
