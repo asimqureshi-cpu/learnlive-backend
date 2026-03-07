@@ -27,6 +27,8 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
 app.use('/api/sessions', sessionRoutes);
+const usersRouter = require('./routes/users');
+app.use('/api/users', usersRouter);
 app.use('/api/materials', materialsRoutes);
 app.use('/api/scoring', scoringRoutes);
 app.use('/api/reports', reportsRoutes);
