@@ -22,6 +22,7 @@ function openDeepgramConnection(sessionId, topic) {
     smart_format: true,
     interim_results: true,
     punctuate: true,
+    diarize: true,
     encoding: 'linear16',
     sample_rate: 16000,
     channels: 1,
