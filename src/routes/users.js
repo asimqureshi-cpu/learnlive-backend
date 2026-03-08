@@ -10,7 +10,7 @@ const supabaseAdmin = createClient(
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-const ALLOWED_DOMAINS = ['edu', 'ac.uk', 'ivey.ca', 'uwo.ca'];
+const ALLOWED_DOMAINS = ['edu', 'ac.uk', 'ivey.ca', 'uwo.ca', 'insead.edu'];
 
 function isValidDomain(email) {
   const domain = (email.split('@')[1] || '').toLowerCase();
@@ -71,13 +71,23 @@ router.get('/', async (req, res) => {
 // DELETE /api/users/:id — remove user
 router.delete('/:id', async (req, res) => {
   try {
+    // Prevent deleting super_admins
+    const { data: target } = await supabase
+      .from('users')
+      .select('role')
+      .eq('id', req.params.id)
+      .single();
+
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (target.role === 'super_admin') return res.status(403).json({ error: 'Cannot delete a super admin' });
+
     await supabaseAdmin.auth.admin.deleteUser(req.params.id);
     await supabase.from('users').delete().eq('id', req.params.id);
     res.json({ success: true });
   } catch (err) {
+    console.error('[Users] Delete error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 module.exports = router;
-
