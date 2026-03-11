@@ -7,10 +7,12 @@ const sessionRMS = new Map();
 const activeSpeakers = new Map();
 const speakerLockUntil = new Map(); // prevent rapid switching
 
-const RMS_SILENCE_THRESHOLD = 0.012;   // below this = silence, don't switch
-const RMS_DOMINANCE_RATIO = 1.8;        // winner must be 1.8x louder than next candidate
-const SPEAKER_LOCK_MS = 800;            // once elected, hold for at least 800ms
-const RMS_SMOOTHING = 0.3;             // exponential smoothing factor (0=slow, 1=instant)
+const RMS_SILENCE_THRESHOLD = 0.010;   // below this = silence
+const RMS_DOMINANCE_RATIO = 1.4;        // challenger needs 1.4x to take over (was 1.8 — too sticky)
+const SPEAKER_LOCK_MS = 600;            // hold for 600ms min (was 800)
+const RMS_SMOOTHING_RISING = 0.5;       // fast attack — react quickly when someone new speaks louder
+const RMS_SMOOTHING_FALLING = 0.15;     // slow decay — don't drop out during natural pauses
+const CURRENT_SPEAKER_SILENCE_MS = 800; // if current speaker silent this long, release lock immediately
 
 function getSessionRMS(sessionId) {
   if (!sessionRMS.has(sessionId)) sessionRMS.set(sessionId, new Map());
@@ -37,8 +39,18 @@ function electActiveSpeaker(sessionId) {
     }
   }
 
-  // Still within speaker lock window — keep current speaker
-  if (now < lockUntil && current) return current;
+  // Within speaker lock window — BUT release early if current speaker has gone silent
+  if (now < lockUntil && current) {
+    const currentData = rmsMap.get(current);
+    const currentSilentFor = currentData ? now - currentData.lastUpdate : 999999;
+    const currentRMS = currentData ? (currentData.smoothedRMS || 0) : 0;
+    // Release lock early if current speaker has been silent for a sustained period
+    if (currentRMS < RMS_SILENCE_THRESHOLD && currentSilentFor > CURRENT_SPEAKER_SILENCE_MS) {
+      // Current speaker went quiet — allow challenger to take over
+    } else {
+      return current;
+    }
+  }
 
   // Find all active participants (not stale)
   const active = [];
@@ -113,8 +125,10 @@ function initWebSocket(server) {
             if (msg.type === 'rms') {
               const rmsMap = getSessionRMS(sessionId);
               const existing = rmsMap.get(participantName) || { smoothedRMS: 0 };
-              // Exponential moving average for smoother RMS
-              const smoothed = existing.smoothedRMS * (1 - RMS_SMOOTHING) + (msg.rms || 0) * RMS_SMOOTHING;
+              // Asymmetric smoothing: fast rise, slow fall — mimics natural speech envelope
+              const rawRMS = msg.rms || 0;
+              const alpha = rawRMS > (existing.smoothedRMS || 0) ? RMS_SMOOTHING_RISING : RMS_SMOOTHING_FALLING;
+              const smoothed = (existing.smoothedRMS || 0) * (1 - alpha) + rawRMS * alpha;
               rmsMap.set(participantName, {
                 rms: msg.rms || 0,
                 smoothedRMS: smoothed,
