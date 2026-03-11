@@ -7,7 +7,7 @@ const { generatePostSessionReport } = require('../services/scoring');
 // Create a new session
 router.post('/', async (req, res) => {
   try {
-    const { title, topic, createdBy, scoringWeights } = req.body;
+    const { title, topic, createdBy, scoringWeights, group_name } = req.body;
     if (!title || !topic) return res.status(400).json({ error: 'title and topic are required' });
 
     const weights = scoringWeights || {
@@ -23,11 +23,13 @@ router.post('/', async (req, res) => {
       created_by: createdBy,
       scoring_weights: weights,
       status: 'pending',
+      group_name: group_name || null,
     }).select().single();
 
     if (error) throw error;
     res.json(data);
   } catch (err) {
+    console.error('[Sessions] Create error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -46,7 +48,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Get single session with participants, scores
+// Get single session
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -66,7 +68,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// Start a session (begin transcription)
+// Start a session
 router.post('/:id/start', async (req, res) => {
   try {
     const { id } = req.params;
@@ -80,62 +82,96 @@ router.post('/:id/start', async (req, res) => {
     }).eq('id', id);
 
     await startTranscription(id, session.topic);
-    res.json({ success: true, message: 'Session started, transcription active' });
+    res.json({ success: true, message: 'Session started' });
   } catch (err) {
+    console.error('[Sessions] Start error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // End a session + generate report
 router.post('/:id/end', async (req, res) => {
+  const { id } = req.params;
+  console.log(`[Sessions] Ending session ${id}`);
+
   try {
-    const { id } = req.params;
+    // 1. Stop transcription (safe even if already stopped)
+    try {
+      await stopTranscription(id);
+    } catch (err) {
+      console.warn('[Sessions] stopTranscription error (non-fatal):', err.message);
+    }
 
-    await stopTranscription(id);
-
-    const [transcripts, scores, materials, session] = await Promise.all([
+    // 2. Fetch all session data — each query independent so one failure doesn't block others
+    const [transcriptResult, scoresResult, materialsResult, sessionResult] = await Promise.all([
       supabase.from('transcripts').select('*').eq('session_id', id).order('timestamp_seconds'),
       supabase.from('scores').select('*').eq('session_id', id),
       supabase.from('materials').select('*').eq('session_id', id),
       supabase.from('sessions').select('*').eq('id', id).single(),
     ]);
 
-    // Build scores map including bloom_level
+    // Log any fetch errors but don't crash
+    if (transcriptResult.error) console.warn('[Sessions] Transcripts fetch error:', transcriptResult.error.message);
+    if (scoresResult.error) console.warn('[Sessions] Scores fetch error:', scoresResult.error.message);
+    if (materialsResult.error) console.warn('[Sessions] Materials fetch error:', materialsResult.error.message);
+    if (sessionResult.error) {
+      console.error('[Sessions] Session fetch error:', sessionResult.error.message);
+      throw new Error('Session not found: ' + sessionResult.error.message);
+    }
+
+    const session = sessionResult.data;
+    const transcripts = transcriptResult.data || [];
+    const scores = scoresResult.data || [];
+    const materials = materialsResult.data || [];
+
+    console.log(`[Sessions] Data fetched — transcripts:${transcripts.length} scores:${scores.length} materials:${materials.length}`);
+
+    // 3. Build scores map
     const scoresMap = {};
-    (scores.data || []).forEach(s => {
+    scores.forEach(s => {
       scoresMap[s.speaker_tag] = {
         participation: s.participation_score,
         topic_adherence: s.topic_adherence_score,
         depth: s.depth_score,
         material_application: s.material_application_score,
         overall: s.overall_score,
-        bloom_level: s.bloom_level || 'unknown',
+        bloom_level: s.bloom_level || 'REMEMBER',
       };
     });
 
-    // Generate AI report
+    // 4. Generate report — has its own internal try/catch, will never throw
+    console.log(`[Sessions] Generating report for session ${id}`);
     const report = await generatePostSessionReport({
       sessionId: id,
-      topic: session.data.topic,
-      transcripts: transcripts.data || [],
+      topic: session.topic || 'General discussion',
+      transcripts,
       scores: scoresMap,
-      materials: materials.data || [],
+      materials,
     });
+    console.log(`[Sessions] Report generated successfully`);
 
-    // Save report + update session status
-    await supabase.from('sessions').update({
+    // 5. Save report + mark session complete
+    const { error: updateError } = await supabase.from('sessions').update({
       status: 'completed',
       ended_at: new Date().toISOString(),
       report: report,
     }).eq('id', id);
 
+    if (updateError) {
+      console.error('[Sessions] Failed to save report:', updateError.message);
+      throw new Error('Failed to save report: ' + updateError.message);
+    }
+
+    console.log(`[Sessions] Session ${id} completed and report saved`);
     res.json({ success: true, report });
+
   } catch (err) {
+    console.error('[Sessions] /end error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get live stats for admin dashboard
+// Get live stats
 router.get('/:id/stats', async (req, res) => {
   try {
     const { id } = req.params;
@@ -153,7 +189,7 @@ router.get('/:id/stats', async (req, res) => {
   }
 });
 
-// Admin issues a prompt to a participant/group
+// Admin issues a prompt
 router.post('/:id/prompt', async (req, res) => {
   try {
     const { id } = req.params;
@@ -181,14 +217,12 @@ router.post('/:id/prompt', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    // Delete related data first
     await Promise.all([
       supabase.from('transcripts').delete().eq('session_id', id),
       supabase.from('scores').delete().eq('session_id', id),
       supabase.from('prompts_log').delete().eq('session_id', id),
       supabase.from('document_chunks').delete().eq('session_id', id),
     ]);
-    // Delete materials from storage
     const { data: materials } = await supabase.from('materials').select('file_path').eq('session_id', id);
     if (materials?.length) {
       await supabase.storage.from('session-materials').remove(materials.map(m => m.file_path));
@@ -200,4 +234,5 @@ router.delete('/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 module.exports = router;
