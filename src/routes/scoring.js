@@ -1,5 +1,5 @@
 const Anthropic = require('@anthropic-ai/sdk');
-const { retrieveRelevantChunks } = require('./rag');
+const { retrieveRelevantChunks } = require('../services/rag');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
