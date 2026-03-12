@@ -8,14 +8,14 @@ const activeSpeakers = new Map();
 const speakerLockUntil = new Map();
 
 // Tuning constants
-const SPEAKER_LOCK_MS = 1000;           // hold active speaker for 1s min
-const NOISE_FLOOR_ALPHA = 0.02;         // very slow noise floor adaptation (only updates during quiet)
+const SPEAKER_LOCK_MS = 800;            // hold active speaker for 800ms min
+const NOISE_FLOOR_ALPHA = 0.05;         // faster noise floor adaptation — laptop floor rises when room gets loud
 const NOISE_FLOOR_INIT = 0.008;         // starting assumption for noise floor
-const SNR_SPEECH_THRESHOLD = 2.0;       // RMS must be 2x above own noise floor to count as speech
-const SNR_DOMINANCE_RATIO = 1.5;        // winner's SNR must be 1.5x second place SNR to take over
-const SILENCE_RELEASE_MS = 1200;        // if active speaker's RMS drops to noise floor for this long, release lock
-const RMS_SMOOTHING_RISING = 0.5;       // fast attack
-const RMS_SMOOTHING_FALLING = 0.12;     // slow decay
+const SNR_SPEECH_THRESHOLD = 2.5;       // RMS must be 2.5x above own noise floor to count as speech
+const SNR_DOMINANCE_RATIO = 2.2;        // winner needs 2.2x SNR advantage — much harder for far mic to steal
+const SILENCE_RELEASE_MS = 800;         // release lock faster when current speaker goes quiet
+const RMS_SMOOTHING_RISING = 0.6;       // faster attack — react to new speaker quickly
+const RMS_SMOOTHING_FALLING = 0.10;     // slower decay — don't drop out mid-sentence
 
 function getSessionRMS(sessionId) {
   if (!sessionRMS.has(sessionId)) sessionRMS.set(sessionId, new Map());
