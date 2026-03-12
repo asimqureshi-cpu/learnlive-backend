@@ -90,5 +90,4 @@ async function retrieveRelevantChunks(sessionId, queryText, topK = 5) {
     return []; // Never throw — always return empty array
   }
 }
-
 module.exports = { embedText, storeChunks, retrieveRelevantChunks };
