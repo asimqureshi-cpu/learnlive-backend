@@ -2,21 +2,66 @@ const { WebSocketServer } = require('ws');
 let wss;
 const sessionClients = new Map();
 
-// Per session: participantName -> { rms, smoothedRMS, manualOverride, lastUpdate }
+// Per session: participantName -> { rms, smoothedRMS, noiseFloor, snr, manualOverride, lastUpdate, lastSpeakingAt }
 const sessionRMS = new Map();
 const activeSpeakers = new Map();
-const speakerLockUntil = new Map(); // prevent rapid switching
+const speakerLockUntil = new Map();
 
-const RMS_SILENCE_THRESHOLD = 0.010;   // below this = silence
-const RMS_DOMINANCE_RATIO = 1.4;        // challenger needs 1.4x to take over (was 1.8 — too sticky)
-const SPEAKER_LOCK_MS = 600;            // hold for 600ms min (was 800)
-const RMS_SMOOTHING_RISING = 0.5;       // fast attack — react quickly when someone new speaks louder
-const RMS_SMOOTHING_FALLING = 0.15;     // slow decay — don't drop out during natural pauses
-const CURRENT_SPEAKER_SILENCE_MS = 800; // if current speaker silent this long, release lock immediately
+// Tuning constants
+const SPEAKER_LOCK_MS = 1000;           // hold active speaker for 1s min
+const NOISE_FLOOR_ALPHA = 0.02;         // very slow noise floor adaptation (only updates during quiet)
+const NOISE_FLOOR_INIT = 0.008;         // starting assumption for noise floor
+const SNR_SPEECH_THRESHOLD = 2.0;       // RMS must be 2x above own noise floor to count as speech
+const SNR_DOMINANCE_RATIO = 1.5;        // winner's SNR must be 1.5x second place SNR to take over
+const SILENCE_RELEASE_MS = 1200;        // if active speaker's RMS drops to noise floor for this long, release lock
+const RMS_SMOOTHING_RISING = 0.5;       // fast attack
+const RMS_SMOOTHING_FALLING = 0.12;     // slow decay
 
 function getSessionRMS(sessionId) {
   if (!sessionRMS.has(sessionId)) sessionRMS.set(sessionId, new Map());
   return sessionRMS.get(sessionId);
+}
+
+function updateParticipantRMS(sessionId, participantName, rawRMS, manualOverride) {
+  const rmsMap = getSessionRMS(sessionId);
+  const existing = rmsMap.get(participantName) || {
+    smoothedRMS: 0,
+    noiseFloor: NOISE_FLOOR_INIT,
+    manualOverride: false,
+    lastUpdate: Date.now(),
+    lastSpeakingAt: 0,
+  };
+
+  // Asymmetric smoothing
+  const alpha = rawRMS > existing.smoothedRMS ? RMS_SMOOTHING_RISING : RMS_SMOOTHING_FALLING;
+  const smoothed = existing.smoothedRMS * (1 - alpha) + rawRMS * alpha;
+
+  // Noise floor: only adapt upward/downward when signal is near silence
+  // This captures the ambient mic level for this specific device in this room
+  let noiseFloor = existing.noiseFloor;
+  const snrEstimate = smoothed / (noiseFloor + 1e-10);
+  if (snrEstimate < 1.5) {
+    // Signal is near noise floor — update noise floor estimate
+    noiseFloor = noiseFloor * (1 - NOISE_FLOOR_ALPHA) + smoothed * NOISE_FLOOR_ALPHA;
+    // Clamp noise floor so it doesn't drift too high or too low
+    noiseFloor = Math.max(0.003, Math.min(0.025, noiseFloor));
+  }
+
+  // SNR for this participant: how much louder than their own noise floor
+  const snr = smoothed / (noiseFloor + 1e-10);
+
+  const now = Date.now();
+  rmsMap.set(participantName, {
+    rms: rawRMS,
+    smoothedRMS: smoothed,
+    noiseFloor,
+    snr,
+    manualOverride,
+    lastUpdate: now,
+    lastSpeakingAt: snr > SNR_SPEECH_THRESHOLD ? now : existing.lastSpeakingAt,
+  });
+
+  return rmsMap.get(participantName);
 }
 
 function electActiveSpeaker(sessionId) {
@@ -27,9 +72,9 @@ function electActiveSpeaker(sessionId) {
   const current = activeSpeakers.get(sessionId);
   const lockUntil = speakerLockUntil.get(sessionId) || 0;
 
-  // Check for manual override first — always wins immediately
+  // Manual override always wins immediately — no lock, no ratio check
   for (const [name, data] of rmsMap.entries()) {
-    if (data.manualOverride && now - data.lastUpdate < 1000) {
+    if (data.manualOverride && now - data.lastUpdate < 1500) {
       if (name !== current) {
         console.log(`[RMS] Override → ${name}`);
         activeSpeakers.set(sessionId, name);
@@ -39,55 +84,70 @@ function electActiveSpeaker(sessionId) {
     }
   }
 
-  // Within speaker lock window — BUT release early if current speaker has gone silent
+  // Within lock window — check if current speaker has gone silent
   if (now < lockUntil && current) {
     const currentData = rmsMap.get(current);
-    const currentSilentFor = currentData ? now - currentData.lastUpdate : 999999;
-    const currentRMS = currentData ? (currentData.smoothedRMS || 0) : 0;
-    // Release lock early if current speaker has been silent for a sustained period
-    if (currentRMS < RMS_SILENCE_THRESHOLD && currentSilentFor > CURRENT_SPEAKER_SILENCE_MS) {
-      // Current speaker went quiet — allow challenger to take over
-    } else {
-      return current;
+    if (currentData) {
+      const silentFor = now - currentData.lastSpeakingAt;
+      // Release lock early only if current speaker has been below speech threshold for a while
+      if (silentFor < SILENCE_RELEASE_MS) {
+        return current; // Still speaking or recently spoke — hold lock
+      }
+      // Fall through — current speaker has gone silent, allow re-election
+      console.log(`[RMS] Lock released — ${current} silent for ${silentFor}ms`);
     }
   }
 
-  // Find all active participants (not stale)
-  const active = [];
+  // Collect active participants with their SNR
+  const candidates = [];
   for (const [name, data] of rmsMap.entries()) {
-    if (now - data.lastUpdate < 1200) {
-      active.push({ name, rms: data.smoothedRMS || data.rms });
+    if (now - data.lastUpdate < 1500) {
+      candidates.push({ name, snr: data.snr, smoothedRMS: data.smoothedRMS, noiseFloor: data.noiseFloor });
     }
   }
 
-  if (active.length === 0) return current;
-  if (active.length === 1) {
-    const only = active[0];
-    if (only.rms < RMS_SILENCE_THRESHOLD) return current;
+  if (candidates.length === 0) return current;
+
+  // Filter to only those actually speaking (SNR above threshold)
+  const speaking = candidates.filter(c => c.snr >= SNR_SPEECH_THRESHOLD);
+
+  if (speaking.length === 0) {
+    // Nobody is speaking — keep current but don't lock
+    return current;
+  }
+
+  if (speaking.length === 1) {
+    const only = speaking[0];
     if (only.name !== current) {
+      console.log(`[RMS] Speaker → ${only.name} (snr=${only.snr.toFixed(2)}, floor=${only.noiseFloor.toFixed(4)})`);
       activeSpeakers.set(sessionId, only.name);
       speakerLockUntil.set(sessionId, now + SPEAKER_LOCK_MS);
     }
     return only.name;
   }
 
-  // Sort by RMS descending
-  active.sort((a, b) => b.rms - a.rms);
-  const top = active[0];
-  const second = active[1];
+  // Multiple people above speech threshold — pick by SNR dominance
+  speaking.sort((a, b) => b.snr - a.snr);
+  const top = speaking[0];
+  const second = speaking[1];
 
-  // Must be above silence threshold
-  if (top.rms < RMS_SILENCE_THRESHOLD) return current;
+  const ratio = top.snr / (second.snr + 1e-10);
 
-  // Must dominate second place by required ratio
-  const ratio = second.rms > 0 ? top.rms / second.rms : 999;
-  if (ratio < RMS_DOMINANCE_RATIO) {
-    // Ambiguous — keep current speaker to avoid thrashing
+  if (ratio < SNR_DOMINANCE_RATIO) {
+    // Ambiguous — keep current speaker
+    // But if current is not in the speaking list at all, switch to top
+    const currentStillSpeaking = speaking.find(c => c.name === current);
+    if (!currentStillSpeaking) {
+      console.log(`[RMS] Speaker → ${top.name} (current gone silent, snr=${top.snr.toFixed(2)})`);
+      activeSpeakers.set(sessionId, top.name);
+      speakerLockUntil.set(sessionId, now + SPEAKER_LOCK_MS);
+      return top.name;
+    }
     return current;
   }
 
   if (top.name !== current) {
-    console.log(`[RMS] Speaker → ${top.name} (rms=${top.rms.toFixed(3)}, ratio=${ratio.toFixed(2)})`);
+    console.log(`[RMS] Speaker → ${top.name} (snr=${top.snr.toFixed(2)}, ratio=${ratio.toFixed(2)}, floor=${top.noiseFloor.toFixed(4)})`);
     activeSpeakers.set(sessionId, top.name);
     speakerLockUntil.set(sessionId, now + SPEAKER_LOCK_MS);
   }
@@ -112,37 +172,25 @@ function initWebSocket(server) {
 
     if (type === 'audio') {
       const rmsMap = getSessionRMS(sessionId);
-      rmsMap.set(participantName, { rms: 0, smoothedRMS: 0, manualOverride: false, lastUpdate: Date.now() });
+      rmsMap.set(participantName, {
+        rms: 0, smoothedRMS: 0, noiseFloor: NOISE_FLOOR_INIT,
+        snr: 0, manualOverride: false, lastUpdate: Date.now(), lastSpeakingAt: 0,
+      });
 
       ws.on('message', (data, isBinary) => {
         if (!sessionId) return;
         const { sendAudioChunk } = require('./transcription');
 
         if (!isBinary) {
-          // RMS control message
           try {
             const msg = JSON.parse(data.toString());
             if (msg.type === 'rms') {
-              const rmsMap = getSessionRMS(sessionId);
-              const existing = rmsMap.get(participantName) || { smoothedRMS: 0 };
-              // Asymmetric smoothing: fast rise, slow fall — mimics natural speech envelope
-              const rawRMS = msg.rms || 0;
-              const alpha = rawRMS > (existing.smoothedRMS || 0) ? RMS_SMOOTHING_RISING : RMS_SMOOTHING_FALLING;
-              const smoothed = (existing.smoothedRMS || 0) * (1 - alpha) + rawRMS * alpha;
-              rmsMap.set(participantName, {
-                rms: msg.rms || 0,
-                smoothedRMS: smoothed,
-                manualOverride: msg.manualOverride || false,
-                lastUpdate: Date.now(),
-              });
+              updateParticipantRMS(sessionId, participantName, msg.rms || 0, msg.manualOverride || false);
               electActiveSpeaker(sessionId);
             }
           } catch (e) {}
         } else {
-          // PCM audio — only forward if this participant is active speaker
           const activeSpeaker = activeSpeakers.get(sessionId);
-
-          // If no active speaker elected yet (session just started), allow through
           if (!activeSpeaker || activeSpeaker === participantName) {
             sendAudioChunk(sessionId, data, participantName);
           }
@@ -153,9 +201,9 @@ function initWebSocket(server) {
         console.log(`[Audio] Stream closed for ${participantName}`);
         const rmsMap = sessionRMS.get(sessionId);
         if (rmsMap) rmsMap.delete(participantName);
-        // If this was the active speaker, clear it
         if (activeSpeakers.get(sessionId) === participantName) {
           activeSpeakers.delete(sessionId);
+          speakerLockUntil.delete(sessionId);
         }
       });
 
