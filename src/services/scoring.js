@@ -107,4 +107,4 @@ Should you intervene? Respond ONLY with valid JSON, no markdown:
   }
 }
 
-module.exports = { scoreUtterance, analyseGroupState };
+module.exports = { scoreUtterance, analyseGroupState, generatePostSessionReport };
