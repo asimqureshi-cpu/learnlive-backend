@@ -190,10 +190,9 @@ function initWebSocket(server) {
             }
           } catch (e) {}
         } else {
-          const activeSpeaker = activeSpeakers.get(sessionId);
-          if (!activeSpeaker || activeSpeaker === participantName) {
-            sendAudioChunk(sessionId, data, participantName);
-          }
+          // No gate — all participants stream simultaneously to their own Deepgram connection
+          // SNR logic controls attribution display only, not who gets transcribed
+          sendAudioChunk(sessionId, data, participantName);
         }
       });
 
@@ -250,4 +249,12 @@ function sendToParticipant(sessionId, participantName, event, data) {
   });
 }
 
-module.exports = { initWebSocket, broadcastToSession, broadcastToAdmins, sendToParticipant };
+// Used by transcription.js for deduplication SNR comparison
+function getParticipantSNR(sessionId, participantName) {
+  const rmsMap = sessionRMS.get(sessionId);
+  if (!rmsMap) return 1.0;
+  const data = rmsMap.get(participantName);
+  return data ? (data.snr || 1.0) : 1.0;
+}
+
+module.exports = { initWebSocket, broadcastToSession, broadcastToAdmins, sendToParticipant, getParticipantSNR };
