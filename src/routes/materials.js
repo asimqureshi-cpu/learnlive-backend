@@ -67,7 +67,6 @@ router.post('/:sessionId/upload', upload.single('file'), async (req, res) => {
     pdfParse(file.buffer).then(async (parsed) => {
       const textSample = parsed.text.slice(0, 2000);
 
-      // Get session topic for relevance scoring
       const { data: session } = await supabase.from('sessions').select('topic').eq('id', sessionId).single();
 
       const [ingestResult, metadata] = await Promise.all([
@@ -75,7 +74,6 @@ router.post('/:sessionId/upload', upload.single('file'), async (req, res) => {
         extractDocumentMetadata(textSample, file.originalname, session?.topic),
       ]);
 
-      // Save metadata back to materials row
       await supabase.from('materials').update({ metadata }).eq('id', material.id);
       console.log(`[Materials] Ingested ${file.originalname}:`, ingestResult);
       console.log(`[Materials] Metadata for ${file.originalname}:`, metadata);
@@ -115,23 +113,5 @@ router.delete('/:materialId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-async function ingestDocument(sessionId, materialId, fileName, buffer) {
-  const pdfParse = require('pdf-parse');
-  const parsed = await pdfParse(buffer);
-  const text = parsed.text;
 
-  // Split into ~500 word chunks with 50 word overlap
-  const words = text.split(/\s+/);
-  const chunks = [];
-  const chunkSize = 500;
-  const overlap = 50;
-  for (let i = 0; i < words.length; i += chunkSize - overlap) {
-    const chunk = words.slice(i, i + chunkSize).join(' ');
-    if (chunk.trim().length > 50) chunks.push(chunk);
-  }
-
-  console.log(`[RAG] Ingesting ${fileName}: ${chunks.length} chunks`);
-  await storeChunks(sessionId, materialId, chunks);
-  return { chunks: chunks.length };
-}
-module.exports = { embedText, storeChunks, retrieveRelevantChunks, ingestDocument };
+module.exports = router;
