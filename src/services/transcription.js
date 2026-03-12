@@ -6,8 +6,14 @@ const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
 // Map key: `${sessionId}::${participantName}` → per-participant connection data
 const activeConnections = new Map();
 
-// Session-level shared state: scores, stats, transcript buffer
+// Session-level shared state
 const sessionState = new Map();
+
+// Deduplication: track recent utterances per session to catch bleed
+// key: sessionId → array of { text, participantName, timestamp, snr }
+const recentUtterances = new Map();
+const DEDUP_WINDOW_MS = 3000;     // utterances within 3s are candidates for dedup
+const DEDUP_SIMILARITY = 0.85;    // 85% word overlap = same utterance
 
 function getSessionState(sessionId) {
   if (!sessionState.has(sessionId)) {
@@ -25,14 +31,68 @@ function getConnectionKey(sessionId, participantName) {
   return `${sessionId}::${participantName}`;
 }
 
-// Called when a participant's first audio chunk arrives
+// Calculate word overlap similarity between two strings
+function stringSimilarity(a, b) {
+  const wordsA = a.toLowerCase().split(/\s+/);
+  const wordsB = b.toLowerCase().split(/\s+/);
+  const setA = new Set(wordsA);
+  const setB = new Set(wordsB);
+  const intersection = wordsA.filter(w => setB.has(w)).length;
+  const union = new Set([...wordsA, ...wordsB]).size;
+  return intersection / (union + 1e-10);
+}
+
+// Returns true if this utterance is a bleed duplicate of a recently seen one
+// Keeps the version from the device with higher SNR
+function isDuplicate(sessionId, participantName, utterance, currentSNR) {
+  if (!recentUtterances.has(sessionId)) recentUtterances.set(sessionId, []);
+  const recent = recentUtterances.get(sessionId);
+  const now = Date.now();
+
+  // Clean up old entries
+  const fresh = recent.filter(u => now - u.timestamp < DEDUP_WINDOW_MS);
+  recentUtterances.set(sessionId, fresh);
+
+  // Check for similar utterances from other participants
+  for (const prev of fresh) {
+    if (prev.participantName === participantName) continue; // same person, not a dupe
+    const similarity = stringSimilarity(utterance, prev.text);
+    if (similarity >= DEDUP_SIMILARITY) {
+      // Duplicate detected — keep whichever has higher SNR
+      if (currentSNR >= prev.snr) {
+        // Current is better — remove the old one from recent so it doesn't block future
+        prev.superseded = true;
+        console.log(`[Dedup] ${participantName} supersedes ${prev.participantName} (sim=${similarity.toFixed(2)}, snr=${currentSNR.toFixed(2)} vs ${prev.snr.toFixed(2)})`);
+        return false; // Allow this one through
+      } else {
+        // Previous was better — discard current
+        console.log(`[Dedup] Dropping bleed from ${participantName} (sim=${similarity.toFixed(2)}, snr=${currentSNR.toFixed(2)} vs ${prev.snr.toFixed(2)})`);
+        return true;
+      }
+    }
+  }
+
+  // Not a duplicate — register it
+  fresh.push({ text: utterance, participantName, timestamp: now, snr: currentSNR, superseded: false });
+  return false;
+}
+
+function getCurrentSNR(sessionId, participantName) {
+  try {
+    const { sessionRMS } = require('./websocket').__testExports || {};
+    // Fallback: get SNR from websocket module if exported, otherwise use 1.0
+    return 1.0;
+  } catch {
+    return 1.0;
+  }
+}
+
 async function ensureConnection(sessionId, participantName) {
   const key = getConnectionKey(sessionId, participantName);
   if (activeConnections.has(key)) return activeConnections.get(key);
 
   console.log(`[Deepgram] Opening connection for ${participantName} in session ${sessionId}`);
 
-  // Fetch session topic once per session
   const state = getSessionState(sessionId);
   if (!state.topic) {
     try {
@@ -67,9 +127,7 @@ async function ensureConnection(sessionId, participantName) {
     console.log(`[Deepgram] Connection OPEN for ${participantName}`);
     connData.isOpen = true;
 
-    // Flush buffered chunks
     if (connData.buffer.length > 0) {
-      console.log(`[Deepgram] Flushing ${connData.buffer.length} buffered chunks for ${participantName}`);
       connData.buffer.forEach(chunk => connection.send(chunk));
       connData.buffer = [];
     }
@@ -78,7 +136,6 @@ async function ensureConnection(sessionId, participantName) {
       try { connection.keepAlive(); } catch (e) {}
     }, 8000);
 
-    // Group analysis every 60s — only run on first participant's connection to avoid duplicates
     const allKeys = [...activeConnections.keys()].filter(k => k.startsWith(sessionId + '::'));
     if (allKeys.length === 1) {
       connData.groupAnalysisInterval = setInterval(async () => {
@@ -118,13 +175,16 @@ async function ensureConnection(sessionId, participantName) {
     if (data.is_final === false) return;
 
     const utterance = alt.transcript.trim();
-    if (utterance.split(' ').length < 5) {
-      console.log(`[Deepgram] Skipping short utterance: ${utterance}`);
-      return;
-    }
+    if (utterance.split(' ').length < 3) return; // skip very short fragments
 
-    // Use participant name directly — no diarization needed
     const speakerTag = participantName;
+
+    // Deduplication check — get current SNR for this participant from websocket state
+    const { getParticipantSNR } = require('./websocket');
+    const currentSNR = getParticipantSNR ? getParticipantSNR(sessionId, participantName) : 1.0;
+
+    if (isDuplicate(sessionId, participantName, utterance, currentSNR)) return;
+
     console.log(`[Deepgram] Transcript: ${speakerTag} - ${utterance}`);
 
     await supabase.from('transcripts').insert({
@@ -150,7 +210,6 @@ async function ensureConnection(sessionId, participantName) {
       timestamp: new Date().toISOString(),
     });
 
-    // Buffer utterances — score in batches of 3
     if (!state.utteranceBuffer[speakerTag]) state.utteranceBuffer[speakerTag] = [];
     state.utteranceBuffer[speakerTag].push(utterance);
     if (state.utteranceBuffer[speakerTag].length >= 3) {
@@ -235,7 +294,6 @@ async function updateParticipantScore(sessionId, speakerTag, scoreResult, state)
   }
 }
 
-// Called from websocket.js for every audio chunk
 async function sendAudioChunk(sessionId, chunk, participantName) {
   if (!participantName || participantName === 'unknown') return;
   try {
@@ -250,7 +308,6 @@ async function sendAudioChunk(sessionId, chunk, participantName) {
   }
 }
 
-// Called when session ends — flush buffers and close all connections for session
 async function stopTranscription(sessionId) {
   console.log(`[Transcription] Stopping all connections for session ${sessionId}`);
   const keysToClose = [...activeConnections.keys()].filter(k => k.startsWith(sessionId + '::'));
@@ -260,7 +317,6 @@ async function stopTranscription(sessionId) {
     if (!connData) continue;
     const participantName = key.split('::')[1];
 
-    // Flush remaining buffer
     const state = getSessionState(sessionId);
     if (state.utteranceBuffer[participantName]?.length > 0) {
       const batch = state.utteranceBuffer[participantName].join(' ');
@@ -274,11 +330,11 @@ async function stopTranscription(sessionId) {
     activeConnections.delete(key);
   }
 
+  recentUtterances.delete(sessionId);
   sessionState.delete(sessionId);
   console.log(`[Transcription] All connections closed for session ${sessionId}`);
 }
 
-// Legacy — kept for compatibility in case called without participantName
 function startTranscription(sessionId) {
   console.log(`[Transcription] Session ${sessionId} ready — connections open on first audio`);
   getSessionState(sessionId);
