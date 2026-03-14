@@ -108,7 +108,7 @@ async function generatePostSessionReport({ sessionId, topic, transcripts, scores
     .map(t => `${t.speaker_name}: ${t.utterance}`)
     .join('\n');
 
-  // Build scores summary using correct column names (topic_adherence, depth, material_application)
+  // Build scores summary using correct column names
   const scoresSummary = Object.entries(scores || {})
     .map(([name, s]) => `${name}: overall=${s.overall ?? 'n/a'}, depth=${s.depth ?? 'n/a'}, topic_adherence=${s.topic_adherence ?? 'n/a'}, bloom=${s.bloom_level || 'unknown'}`)
     .join('\n');
@@ -143,20 +143,28 @@ ${scoresSummary || 'No scores recorded'}
 Full transcript:
 ${transcriptText || '(no transcript)'}
 
-Generate a comprehensive post-session report. Respond ONLY with valid JSON, no markdown:
+Generate a comprehensive post-session report. For each participant, provide four distinct fields:
+- contribution_quality: A 1-2 sentence overall assessment of their discussion performance
+- highlight: The single strongest thing they did — specific, grounded in what they actually said
+- gap: The most important area they need to develop — honest and specific, not generic
+- recommendation: One concrete, actionable thing they should do differently next time
+
+Respond ONLY with valid JSON, no markdown:
 {
   "executive_summary": "<2-3 sentence overview of discussion quality>",
   "group_performance": {
     "strengths": ["<strength 1>", "<strength 2>"],
     "gaps": ["<gap 1>", "<gap 2>"],
-    "bloom_summary": "<summary of Bloom levels demonstrated>",
+    "bloom_summary": "<summary of Bloom levels demonstrated across the group>",
     "material_coverage": "<how well the discussion engaged with course materials, or note if none uploaded>"
   },
   "individual_insights": {
     "<participant name>": {
-      "contribution_quality": "<assessment>",
-      "bloom_level": "<highest level reached>",
-      "recommendation": "<specific actionable feedback>"
+      "contribution_quality": "<1-2 sentence overall assessment>",
+      "highlight": "<their single strongest contribution or behaviour>",
+      "gap": "<their most important area to develop>",
+      "bloom_level": "<highest Bloom level they reached: REMEMBER|UNDERSTAND|APPLY|ANALYSE|EVALUATE|CREATE>",
+      "recommendation": "<one concrete actionable thing to do differently next time>"
     }
   },
   "missed_concepts": ["<concept 1>", "<concept 2>"],
@@ -192,6 +200,8 @@ Generate a comprehensive post-session report. Respond ONLY with valid JSON, no m
       individual_insights: Object.fromEntries(
         participantNames.map(name => [name, {
           contribution_quality: scores[name] ? `Overall score: ${scores[name].overall}` : 'No data',
+          highlight: 'Unable to assess — please review transcript manually',
+          gap: 'Unable to assess — please review transcript manually',
           bloom_level: scores[name]?.bloom_level || 'Unknown',
           recommendation: 'Review transcript manually',
         }])
