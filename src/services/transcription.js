@@ -10,15 +10,15 @@ const activeConnections = new Map();
 const sessionState = new Map();
 
 // Deduplication: track recent utterances per session to catch bleed
-// key: sessionId → array of { text, participantName, timestamp, snr }
 const recentUtterances = new Map();
-const DEDUP_WINDOW_MS = 3000;     // utterances within 3s are candidates for dedup
-const DEDUP_SIMILARITY = 0.85;    // 85% word overlap = same utterance
+const DEDUP_WINDOW_MS = 3000;
+const DEDUP_SIMILARITY = 0.85;
 
 function getSessionState(sessionId) {
   if (!sessionState.has(sessionId)) {
     sessionState.set(sessionId, {
       topic: null,
+      sessionConfig: {},       // cached session_config JSONB — fetched once on start
       participantStats: {},
       recentTranscript: [],
       utteranceBuffer: {},
@@ -31,48 +31,38 @@ function getConnectionKey(sessionId, participantName) {
   return `${sessionId}::${participantName}`;
 }
 
-// Calculate word overlap similarity between two strings
 function stringSimilarity(a, b) {
   const wordsA = a.toLowerCase().split(/\s+/);
   const wordsB = b.toLowerCase().split(/\s+/);
-  const setA = new Set(wordsA);
   const setB = new Set(wordsB);
   const intersection = wordsA.filter(w => setB.has(w)).length;
   const union = new Set([...wordsA, ...wordsB]).size;
   return intersection / (union + 1e-10);
 }
 
-// Returns true if this utterance is a bleed duplicate of a recently seen one
-// Keeps the version from the device with higher SNR
 function isDuplicate(sessionId, participantName, utterance, currentSNR) {
   if (!recentUtterances.has(sessionId)) recentUtterances.set(sessionId, []);
   const recent = recentUtterances.get(sessionId);
   const now = Date.now();
 
-  // Clean up old entries
   const fresh = recent.filter(u => now - u.timestamp < DEDUP_WINDOW_MS);
   recentUtterances.set(sessionId, fresh);
 
-  // Check for similar utterances from other participants
   for (const prev of fresh) {
-    if (prev.participantName === participantName) continue; // same person, not a dupe
+    if (prev.participantName === participantName) continue;
     const similarity = stringSimilarity(utterance, prev.text);
     if (similarity >= DEDUP_SIMILARITY) {
-      // Duplicate detected — keep whichever has higher SNR
       if (currentSNR >= prev.snr) {
-        // Current is better — remove the old one from recent so it doesn't block future
         prev.superseded = true;
         console.log(`[Dedup] ${participantName} supersedes ${prev.participantName} (sim=${similarity.toFixed(2)}, snr=${currentSNR.toFixed(2)} vs ${prev.snr.toFixed(2)})`);
-        return false; // Allow this one through
+        return false;
       } else {
-        // Previous was better — discard current
         console.log(`[Dedup] Dropping bleed from ${participantName} (sim=${similarity.toFixed(2)}, snr=${currentSNR.toFixed(2)} vs ${prev.snr.toFixed(2)})`);
         return true;
       }
     }
   }
 
-  // Not a duplicate — register it
   fresh.push({ text: utterance, participantName, timestamp: now, snr: currentSNR, superseded: false });
   return false;
 }
@@ -83,8 +73,7 @@ async function ensureConnection(sessionId, participantName) {
 
   console.log(`[Deepgram] Opening connection for ${participantName} in session ${sessionId}`);
 
-  // FIX #2: Placeholder set BEFORE any await — prevents race condition where two
-  // rapid audio chunks both pass the has(key) check and open duplicate connections
+  // FIX #2: Placeholder set BEFORE any await — prevents race condition
   const connData = {
     connection: null,
     buffer: [],
@@ -97,8 +86,9 @@ async function ensureConnection(sessionId, participantName) {
   const state = getSessionState(sessionId);
   if (!state.topic) {
     try {
-      const { data } = await supabase.from('sessions').select('topic').eq('id', sessionId).single();
+      const { data } = await supabase.from('sessions').select('topic, session_config').eq('id', sessionId).single();
       state.topic = data?.topic || '';
+      state.sessionConfig = data?.session_config || {};
     } catch (e) {}
   }
 
@@ -140,6 +130,7 @@ async function ensureConnection(sessionId, participantName) {
             topic: state.topic,
             participantStats: state.participantStats,
             recentTranscript: state.recentTranscript.join('\n'),
+            sessionConfig: state.sessionConfig,
           });
           if (result.intervention_needed && result.prompt) {
             console.log(`[Group] Auto-nudge: ${result.type} -> ${result.target}`);
@@ -167,11 +158,10 @@ async function ensureConnection(sessionId, participantName) {
     if (data.is_final === false) return;
 
     const utterance = alt.transcript.trim();
-    if (utterance.split(' ').length < 3) return; // skip very short fragments
+    if (utterance.split(' ').length < 3) return;
 
     const speakerTag = participantName;
 
-    // Deduplication check — get current SNR for this participant from websocket state
     const { getParticipantSNR } = require('./websocket');
     const currentSNR = getParticipantSNR ? getParticipantSNR(sessionId, participantName) : 1.0;
 
@@ -179,7 +169,7 @@ async function ensureConnection(sessionId, participantName) {
 
     console.log(`[Deepgram] Transcript: ${speakerTag} - ${utterance}`);
 
-    // FIX #4: Use correct DB column names — speaker_name and utterance (confirmed via schema)
+    // Confirmed DB column names: speaker_name, utterance
     await supabase.from('transcripts').insert({
       session_id: sessionId,
       speaker_name: speakerTag,
@@ -231,7 +221,8 @@ async function scoreAndBroadcast(sessionId, state, speakerTag, batch) {
   try {
     const { scoreUtterance } = require('./scoring');
     const { broadcastToAdmins } = require('./websocket');
-    const scoreResult = await scoreUtterance(sessionId, speakerTag, batch, state.topic);
+    // Pass sessionConfig so scoring can use objectives if enabled
+    const scoreResult = await scoreUtterance(sessionId, speakerTag, batch, state.topic, state.sessionConfig);
     if (!scoreResult) {
       console.warn(`[Scoring] No result returned for ${speakerTag} — batch dropped`);
       return;
@@ -243,6 +234,7 @@ async function scoreAndBroadcast(sessionId, state, speakerTag, batch) {
       speakerTag,
       scores: scoreResult.scores,
       bloom_level: scoreResult.bloom_level,
+      objective_scores: scoreResult.objective_scores || null,
       participationStats: state.participantStats[speakerTag],
     });
   } catch (err) {
@@ -331,9 +323,12 @@ async function stopTranscription(sessionId) {
   console.log(`[Transcription] All connections closed for session ${sessionId}`);
 }
 
-function startTranscription(sessionId) {
+// startTranscription now accepts sessionConfig to cache it immediately
+function startTranscription(sessionId, topic, sessionConfig) {
   console.log(`[Transcription] Session ${sessionId} ready — connections open on first audio`);
-  getSessionState(sessionId);
+  const state = getSessionState(sessionId);
+  if (topic) state.topic = topic;
+  if (sessionConfig) state.sessionConfig = sessionConfig;
 }
 
 function getSessionStats(sessionId) {
