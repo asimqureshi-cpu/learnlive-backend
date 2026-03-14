@@ -77,30 +77,14 @@ function isDuplicate(sessionId, participantName, utterance, currentSNR) {
   return false;
 }
 
-function getCurrentSNR(sessionId, participantName) {
-  try {
-    const { sessionRMS } = require('./websocket').__testExports || {};
-    // Fallback: get SNR from websocket module if exported, otherwise use 1.0
-    return 1.0;
-  } catch {
-    return 1.0;
-  }
-}
-
 async function ensureConnection(sessionId, participantName) {
   const key = getConnectionKey(sessionId, participantName);
   if (activeConnections.has(key)) return activeConnections.get(key);
 
   console.log(`[Deepgram] Opening connection for ${participantName} in session ${sessionId}`);
 
-  const state = getSessionState(sessionId);
-  if (!state.topic) {
-    try {
-      const { data } = await supabase.from('sessions').select('topic').eq('id', sessionId).single();
-      state.topic = data?.topic || '';
-    } catch (e) {}
-  }
-
+  // FIX #2: Placeholder set BEFORE any await — prevents race condition where two
+  // rapid audio chunks both pass the has(key) check and open duplicate connections
   const connData = {
     connection: null,
     buffer: [],
@@ -109,6 +93,14 @@ async function ensureConnection(sessionId, participantName) {
     groupAnalysisInterval: null,
   };
   activeConnections.set(key, connData);
+
+  const state = getSessionState(sessionId);
+  if (!state.topic) {
+    try {
+      const { data } = await supabase.from('sessions').select('topic').eq('id', sessionId).single();
+      state.topic = data?.topic || '';
+    } catch (e) {}
+  }
 
   const connection = deepgramClient.listen.live({
     model: 'nova-2',
@@ -187,10 +179,11 @@ async function ensureConnection(sessionId, participantName) {
 
     console.log(`[Deepgram] Transcript: ${speakerTag} - ${utterance}`);
 
+    // FIX #4: Use correct DB column names — speaker_name and utterance (confirmed via schema)
     await supabase.from('transcripts').insert({
       session_id: sessionId,
       speaker_name: speakerTag,
-      utterance,
+      utterance: utterance,
       timestamp_seconds: 0,
     });
 
@@ -239,7 +232,10 @@ async function scoreAndBroadcast(sessionId, state, speakerTag, batch) {
     const { scoreUtterance } = require('./scoring');
     const { broadcastToAdmins } = require('./websocket');
     const scoreResult = await scoreUtterance(sessionId, speakerTag, batch, state.topic);
-    if (!scoreResult) return;
+    if (!scoreResult) {
+      console.warn(`[Scoring] No result returned for ${speakerTag} — batch dropped`);
+      return;
+    }
 
     await updateParticipantScore(sessionId, speakerTag, scoreResult, state);
 
@@ -340,4 +336,10 @@ function startTranscription(sessionId) {
   getSessionState(sessionId);
 }
 
-module.exports = { sendAudioChunk, startTranscription, stopTranscription };
+function getSessionStats(sessionId) {
+  const state = sessionState.get(sessionId);
+  if (!state) return {};
+  return state.participantStats;
+}
+
+module.exports = { sendAudioChunk, startTranscription, stopTranscription, getSessionStats };
