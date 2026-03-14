@@ -1,4 +1,3 @@
-
 const Anthropic = require('@anthropic-ai/sdk');
 const { retrieveRelevantChunks } = require('./rag');
 
@@ -104,12 +103,12 @@ Should you intervene? Respond ONLY with valid JSON, no markdown:
 }
 
 async function generatePostSessionReport({ sessionId, topic, transcripts, scores, materials }) {
-  // Build transcript text grouped by speaker
+  // FIX #4: Use correct DB column names — speaker_name and utterance (confirmed via schema)
   const transcriptText = (transcripts || [])
-    .map(t => `${t.speaker_tag}: ${t.utterance_text}`)
+    .map(t => `${t.speaker_name}: ${t.utterance}`)
     .join('\n');
 
-  // Build scores summary
+  // Build scores summary using correct column names (topic_adherence, depth, material_application)
   const scoresSummary = Object.entries(scores || {})
     .map(([name, s]) => `${name}: overall=${s.overall ?? 'n/a'}, depth=${s.depth ?? 'n/a'}, topic_adherence=${s.topic_adherence ?? 'n/a'}, bloom=${s.bloom_level || 'unknown'}`)
     .join('\n');
@@ -118,7 +117,6 @@ async function generatePostSessionReport({ sessionId, topic, transcripts, scores
   const hasMaterials = (materials || []).length > 0;
 
   if (transcriptText.trim().length === 0 && participantNames.length === 0) {
-    // Return a minimal valid report so the session can still be marked complete
     return {
       executive_summary: 'No discussion data was recorded for this session.',
       group_performance: {
@@ -183,7 +181,6 @@ Generate a comprehensive post-session report. Respond ONLY with valid JSON, no m
 
   } catch (err) {
     console.error('[Report] Generation error:', err.message);
-    // Return a valid fallback so the 500 doesn't block session completion
     return {
       executive_summary: 'Report generation encountered an error. Raw session data has been saved.',
       group_performance: {
