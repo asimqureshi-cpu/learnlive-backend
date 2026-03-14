@@ -4,13 +4,15 @@ const supabase = require('../services/supabase');
 const { startTranscription, stopTranscription, getSessionStats } = require('../services/transcription');
 const { generatePostSessionReport } = require('../services/scoring');
 
-// Create a new session
+// ─── Create a new session ─────────────────────────────────────────────────────
 router.post('/', async (req, res) => {
   try {
-    const { title, topic, createdBy, scoringWeights, group_name } = req.body;
+    const { title, topic, createdBy, scoringWeights, group_name, session_config } = req.body;
     if (!title || !topic) return res.status(400).json({ error: 'title and topic are required' });
 
-    const weights = scoringWeights || {
+    // Legacy scoring_weights kept for backward compat;
+    // new sessions use session_config.scoring_weights
+    const weights = scoringWeights || session_config?.scoring_weights || {
       participation: 0.2,
       topic_adherence: 0.2,
       depth: 0.3,
@@ -24,6 +26,7 @@ router.post('/', async (req, res) => {
       scoring_weights: weights,
       status: 'pending',
       group_name: group_name || null,
+      session_config: session_config || {},
     }).select().single();
 
     if (error) throw error;
@@ -34,7 +37,38 @@ router.post('/', async (req, res) => {
   }
 });
 
-// Get all sessions
+// ─── Update session config (wizard final step or mid-setup edits) ─────────────
+// PATCH /api/sessions/:id/config
+router.patch('/:id/config', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { session_config } = req.body;
+    if (!session_config) return res.status(400).json({ error: 'session_config is required' });
+
+    // Merge with existing config rather than overwrite
+    const { data: existing } = await supabase
+      .from('sessions').select('session_config').eq('id', id).single();
+
+    const merged = { ...(existing?.session_config || {}), ...session_config };
+
+    // Also sync scoring_weights column from config for backward compat
+    const updatePayload = { session_config: merged };
+    if (session_config.scoring_weights) {
+      updatePayload.scoring_weights = session_config.scoring_weights;
+    }
+
+    const { data, error } = await supabase
+      .from('sessions').update(updatePayload).eq('id', id).select().single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error('[Sessions] Config update error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Get all sessions ─────────────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -48,7 +82,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Get single session
+// ─── Get single session ───────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -68,7 +102,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// Start a session
+// ─── Start a session ──────────────────────────────────────────────────────────
 router.post('/:id/start', async (req, res) => {
   try {
     const { id } = req.params;
@@ -81,7 +115,7 @@ router.post('/:id/start', async (req, res) => {
       started_at: new Date().toISOString(),
     }).eq('id', id);
 
-    await startTranscription(id, session.topic);
+    await startTranscription(id, session.topic, session.session_config);
     res.json({ success: true, message: 'Session started' });
   } catch (err) {
     console.error('[Sessions] Start error:', err.message);
@@ -89,20 +123,18 @@ router.post('/:id/start', async (req, res) => {
   }
 });
 
-// End a session + generate report
+// ─── End a session + generate report ─────────────────────────────────────────
 router.post('/:id/end', async (req, res) => {
   const { id } = req.params;
   console.log(`[Sessions] Ending session ${id}`);
 
   try {
-    // 1. Stop transcription (safe even if already stopped)
     try {
       await stopTranscription(id);
     } catch (err) {
       console.warn('[Sessions] stopTranscription error (non-fatal):', err.message);
     }
 
-    // 2. Fetch all session data — each query independent so one failure doesn't block others
     const [transcriptResult, scoresResult, materialsResult, sessionResult] = await Promise.all([
       supabase.from('transcripts').select('*').eq('session_id', id).order('timestamp_seconds'),
       supabase.from('scores').select('*').eq('session_id', id),
@@ -110,14 +142,10 @@ router.post('/:id/end', async (req, res) => {
       supabase.from('sessions').select('*').eq('id', id).single(),
     ]);
 
-    // Log any fetch errors but don't crash
     if (transcriptResult.error) console.warn('[Sessions] Transcripts fetch error:', transcriptResult.error.message);
     if (scoresResult.error) console.warn('[Sessions] Scores fetch error:', scoresResult.error.message);
     if (materialsResult.error) console.warn('[Sessions] Materials fetch error:', materialsResult.error.message);
-    if (sessionResult.error) {
-      console.error('[Sessions] Session fetch error:', sessionResult.error.message);
-      throw new Error('Session not found: ' + sessionResult.error.message);
-    }
+    if (sessionResult.error) throw new Error('Session not found: ' + sessionResult.error.message);
 
     const session = sessionResult.data;
     const transcripts = transcriptResult.data || [];
@@ -126,9 +154,7 @@ router.post('/:id/end', async (req, res) => {
 
     console.log(`[Sessions] Data fetched — transcripts:${transcripts.length} scores:${scores.length} materials:${materials.length}`);
 
-    // 3. Build scores map
-    // FIX #4b: Use correct column names confirmed via DB schema
-    // Columns: speaker_tag, topic_adherence, depth, material_application, overall_score, bloom_level
+    // Build scores map using correct column names
     const scoresMap = {};
     scores.forEach(s => {
       scoresMap[s.speaker_tag] = {
@@ -140,7 +166,6 @@ router.post('/:id/end', async (req, res) => {
       };
     });
 
-    // 4. Generate report — has its own internal try/catch, will never throw
     console.log(`[Sessions] Generating report for session ${id}`);
     const report = await generatePostSessionReport({
       sessionId: id,
@@ -148,20 +173,17 @@ router.post('/:id/end', async (req, res) => {
       transcripts,
       scores: scoresMap,
       materials,
+      sessionConfig: session.session_config || {},
     });
     console.log(`[Sessions] Report generated successfully`);
 
-    // 5. Save report + mark session complete
     const { error: updateError } = await supabase.from('sessions').update({
       status: 'completed',
       ended_at: new Date().toISOString(),
       report: report,
     }).eq('id', id);
 
-    if (updateError) {
-      console.error('[Sessions] Failed to save report:', updateError.message);
-      throw new Error('Failed to save report: ' + updateError.message);
-    }
+    if (updateError) throw new Error('Failed to save report: ' + updateError.message);
 
     console.log(`[Sessions] Session ${id} completed and report saved`);
     res.json({ success: true, report });
@@ -172,7 +194,7 @@ router.post('/:id/end', async (req, res) => {
   }
 });
 
-// Get live stats
+// ─── Get live stats ───────────────────────────────────────────────────────────
 router.get('/:id/stats', async (req, res) => {
   try {
     const { id } = req.params;
@@ -190,7 +212,7 @@ router.get('/:id/stats', async (req, res) => {
   }
 });
 
-// Admin issues a prompt
+// ─── Admin issues a prompt ────────────────────────────────────────────────────
 router.post('/:id/prompt', async (req, res) => {
   try {
     const { id } = req.params;
@@ -214,7 +236,7 @@ router.post('/:id/prompt', async (req, res) => {
   }
 });
 
-// Delete a session
+// ─── Delete a session ─────────────────────────────────────────────────────────
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
