@@ -127,13 +127,14 @@ router.post('/:id/end', async (req, res) => {
     console.log(`[Sessions] Data fetched — transcripts:${transcripts.length} scores:${scores.length} materials:${materials.length}`);
 
     // 3. Build scores map
+    // FIX #4b: Use correct column names confirmed via DB schema
+    // Columns: speaker_tag, topic_adherence, depth, material_application, overall_score, bloom_level
     const scoresMap = {};
     scores.forEach(s => {
       scoresMap[s.speaker_tag] = {
-        participation: s.participation_score,
-        topic_adherence: s.topic_adherence_score,
-        depth: s.depth_score,
-        material_application: s.material_application_score,
+        topic_adherence: s.topic_adherence,
+        depth: s.depth,
+        material_application: s.material_application,
         overall: s.overall_score,
         bloom_level: s.bloom_level || 'REMEMBER',
       };
