@@ -18,7 +18,7 @@ const DEDUP_SIMILARITY = 0.85;
 const PROMPT_COOLDOWN_MS = 60000;
 
 // ─── Minimum utterances before we attempt analysis ────────────────────────────
-const MIN_UTTERANCES_FOR_ANALYSIS = 4;
+const MIN_UTTERANCES_FOR_ANALYSIS = 2;
 
 function getSessionState(sessionId) {
   if (!sessionState.has(sessionId)) {
@@ -165,20 +165,23 @@ ${recentlyFired ? `Already fired (do not repeat or send something too similar):\
 ${professorPromptsText ? `\n${professorPromptsText}\n` : ''}
 ${enabledInterventions ? `\nConfigured intervention prompts:\n${enabledInterventions}\n` : ''}
 
-Analyse this discussion carefully. Ask yourself:
-- Is someone genuinely silent and disengaged (not just listening)?
-- Is the quality of reasoning shallow — agreement without analysis, summarising without evaluation?
-- Is the discussion drifting away from the topic or objectives?
-- Is someone dominating in a way that prevents others from contributing?
-- Would a specific discussion prompt from the professor's list significantly deepen the conversation right now?
-- OR is the discussion actually going well and needs no intervention?
+Analyse this discussion carefully. Focus on CONTENT QUALITY, not just who spoke.
+
+Key questions:
+1. Is the student only summarising/recalling the paper without analysing or evaluating it? (SHALLOW — most common problem)
+2. Is the student drifting from the topic or failing to connect their points to the learning objectives?
+3. Is the student not applying frameworks from the material to their examples?
+4. Is the discussion actually going well — student is analysing, evaluating, applying concepts critically?
 
 DECISION RULES:
-- If the discussion is flowing well — return no_action
-- Individual nudge: only for a student who is CLEARLY disengaged or whose contributions are consistently shallow
-- Group prompt: when the WHOLE discussion needs to go deeper, change direction, or engage with a specific concept from the material
-- If using professor's prompts, pick the one most relevant to what was JUST discussed
-- The prompt text must feel like a natural continuation of the conversation — it should reference what was actually just said
+- NEVER fire DOMINATING if there is only one participant — it makes no sense
+- NEVER fire SILENT if the student just spoke in the last 30 seconds
+- Fire SHALLOW when student is only recalling/summarising without analysis or critical evaluation
+- Fire OFF_TOPIC when student's example or point doesn't connect back to the material or objectives
+- Fire a GROUP prompt (DEEPENING) when the student needs to go deeper using specific concepts from the material
+- If the student is doing well — return no_action
+- The prompt MUST reference what the student actually just said — be specific, not generic
+- Prefer using the professor's prompts as a base, adapted to be contextually relevant to what was just said
 - Never send the same or similar prompt twice
 
 Respond ONLY with one of these JSON formats, no markdown:
@@ -258,13 +261,17 @@ Respond ONLY with one of these JSON formats, no markdown:
     }
 
     // Log to DB for report
-    await supabase.from('prompts_log').insert({
-      session_id: sessionId,
-      target: result.target || 'group',
-      prompt_text: result.prompt,
-      prompt_type: result.type || result.action,
-      issued_by: 'ai_engine',
-    }).catch(() => {});
+    try {
+      await supabase.from('prompts_log').insert({
+        session_id: sessionId,
+        target: result.target || 'group',
+        prompt_text: result.prompt,
+        prompt_type: result.type || result.action,
+        issued_by: 'ai_engine',
+      });
+    } catch (logErr) {
+      console.warn('[Prompt Engine] DB log failed (non-fatal):', logErr.message);
+    }
 
   } catch (err) {
     console.error('[Prompt Engine] Error:', err.message);
@@ -322,7 +329,7 @@ async function ensureConnection(sessionId, participantName) {
         analyseAndPrompt(sessionId).catch(err =>
           console.error('[Prompt Engine] Interval error:', err.message)
         );
-      }, 60000);
+      }, 30000);
       console.log(`[Prompt Engine] Analysis loop started for session ${sessionId}`);
     }
   });
