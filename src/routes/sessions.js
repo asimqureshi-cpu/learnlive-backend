@@ -136,10 +136,8 @@ router.post('/:id/start', async (req, res) => {
       status: 'active', started_at: new Date().toISOString(),
     }).eq('id', id);
 
-    // Start transcription + schedule general prompts
     await startTranscription(id, session.topic, session.session_config);
 
-    // Broadcast SESSION_STARTED with opening question to all connected clients
     const { broadcastToSession } = require('../services/websocket');
     const openingQuestion = session.session_config?.opening_question;
     if (openingQuestion) {
@@ -150,10 +148,7 @@ router.post('/:id/start', async (req, res) => {
       });
       console.log(`[Sessions] Opening question broadcast for session ${id}`);
     } else {
-      broadcastToSession(id, 'SESSION_STARTED', {
-        topic: session.topic,
-        session_type: session.session_config?.session_type || 'group',
-      });
+      broadcastToSession(id, 'SESSION_STARTED', { topic: session.topic });
     }
 
     res.json({ success: true, message: 'Session started' });
@@ -169,18 +164,15 @@ router.post('/:id/end', async (req, res) => {
   console.log(`[Sessions] Ending session ${id}`);
 
   try {
-    // Capture intervention log before stopping transcription
-    const interventionLog = getInterventionLog(id);
-
+    // Stop transcription FIRST — clears analysis interval so no more nudges fire
     try { await stopTranscription(id); }
     catch (err) { console.warn('[Sessions] stopTranscription error (non-fatal):', err.message); }
 
-    const [transcriptResult, scoresResult, materialsResult, sessionResult, promptsResult] = await Promise.all([
+    const [transcriptResult, scoresResult, materialsResult, sessionResult] = await Promise.all([
       supabase.from('transcripts').select('*').eq('session_id', id).order('timestamp_seconds'),
       supabase.from('scores').select('*').eq('session_id', id),
       supabase.from('materials').select('*').eq('session_id', id),
       supabase.from('sessions').select('*').eq('id', id).single(),
-      supabase.from('prompts_log').select('*').eq('session_id', id),
     ]);
 
     if (sessionResult.error) throw new Error('Session not found: ' + sessionResult.error.message);
@@ -189,7 +181,8 @@ router.post('/:id/end', async (req, res) => {
     const transcripts = transcriptResult.data || [];
     const scores = scoresResult.data || [];
     const materials = materialsResult.data || [];
-    const promptsLog = promptsResult.data || [];
+
+    console.log(`[Sessions] Data fetched — transcripts:${transcripts.length} scores:${scores.length} materials:${materials.length}`);
 
     const scoresMap = {};
     scores.forEach(s => {
@@ -200,14 +193,14 @@ router.post('/:id/end', async (req, res) => {
       };
     });
 
+    console.log(`[Sessions] Generating report for session ${id}`);
     const report = await generatePostSessionReport({
       sessionId: id,
       topic: session.topic || 'General discussion',
       transcripts, scores: scoresMap, materials,
       sessionConfig: session.session_config || {},
-      interventionLog,
-      promptsLog,
     });
+    console.log(`[Sessions] Report generated successfully`);
 
     const { error: updateError } = await supabase.from('sessions').update({
       status: 'completed', ended_at: new Date().toISOString(), report,
