@@ -330,4 +330,10 @@ function getSessionInfo(sessionId) {
   };
 }
 
-module.exports = { sendAudioChunk, startTranscription, stopTranscription, getSessionStats, getSessionInfo };
+// getInterventionLog — sessions.js /end calls this before stopTranscription.
+// Returns empty array — the real log is in prompts_log table (written by analysis interval).
+function getInterventionLog(sessionId) {
+  return [];
+}
+
+module.exports = { sendAudioChunk, startTranscription, stopTranscription, getSessionStats, getSessionInfo, getInterventionLog };
