@@ -12,7 +12,13 @@ const recentUtterances = new Map();
 
 const DEDUP_WINDOW_MS = 3000;
 const DEDUP_SIMILARITY = 0.85;
-const INTERVENTION_COOLDOWN_MS = 60000; // 60s between any targeted intervention
+
+// ─── Minimum gap between ANY prompt (group or individual) ─────────────────────
+// Prevents flooding. After a prompt fires, nothing fires for 60s.
+const PROMPT_COOLDOWN_MS = 60000;
+
+// ─── Minimum utterances before we attempt analysis ────────────────────────────
+const MIN_UTTERANCES_FOR_ANALYSIS = 4;
 
 function getSessionState(sessionId) {
   if (!sessionState.has(sessionId)) {
@@ -20,13 +26,11 @@ function getSessionState(sessionId) {
       topic: null,
       sessionConfig: {},
       participantStats: {},
-      recentTranscript: [],       // last 30 utterances with full text
+      recentTranscript: [],     // { speaker, text, timestamp } — last 40 utterances
       utteranceBuffer: {},
-      firedInterventions: [],     // { type, target, prompt, timestamp, context }
-      lastInterventionAt: 0,      // timestamp of last targeted intervention
-      promptSchedulerInterval: null,
-      scheduledPromptsQueue: [],  // professor prompts queued to fire at intervals
-      nextScheduledPromptIndex: 0,
+      firedPrompts: [],         // all prompts fired this session for dedup/report
+      lastPromptAt: 0,          // timestamp of last prompt fired (any type)
+      analysisInterval: null,
     });
   }
   return sessionState.get(sessionId);
@@ -55,109 +59,143 @@ function isDuplicate(sessionId, participantName, utterance, currentSNR) {
     if (prev.participantName === participantName) continue;
     const similarity = stringSimilarity(utterance, prev.text);
     if (similarity >= DEDUP_SIMILARITY) {
-      if (currentSNR >= prev.snr) {
-        prev.superseded = true;
-        return false;
-      } else {
-        return true;
-      }
+      if (currentSNR >= prev.snr) { prev.superseded = true; return false; }
+      else { return true; }
     }
   }
   fresh.push({ text: utterance, participantName, timestamp: now, snr: currentSNR });
   return false;
 }
 
-// ─── Context-aware intervention analysis ─────────────────────────────────────
-// Reads actual conversation content + material context.
-// Only fires targeted prompts to individuals.
-// Respects 60s cooldown.
-async function analyseAndIntervene(sessionId) {
+// ─── Unified context-aware prompt engine ─────────────────────────────────────
+//
+// This is the single place where ALL prompts are decided. It runs every 60s.
+// Claude reads:
+//   - Full recent transcript (last 20 utterances)
+//   - Participation stats (who spoke, how much)
+//   - Relevant material chunks from RAG
+//   - Session objectives
+//   - Professor's configured prompts (as reference/options, not fixed)
+//   - Already-fired prompts (to avoid repeats)
+//
+// Claude decides:
+//   A) No intervention needed — say nothing
+//   B) Individual nudge needed — targeted to one student, personal card
+//   C) Group prompt needed — broadcast to all, from professor list or Claude-generated
+//
+// The 60s cooldown applies to ALL outcomes B and C combined.
+//
+async function analyseAndPrompt(sessionId) {
   const state = getSessionState(sessionId);
-  if (!state || Object.keys(state.participantStats).length === 0) return;
+  if (!state) return;
+
+  // Not enough data yet
+  if (state.recentTranscript.length < MIN_UTTERANCES_FOR_ANALYSIS) return;
+  if (Object.keys(state.participantStats).length === 0) return;
 
   const now = Date.now();
 
-  // Enforce cooldown — don't even call Claude if too soon
-  if (now - state.lastInterventionAt < INTERVENTION_COOLDOWN_MS) return;
-
-  // Need at least a few utterances before we can meaningfully analyse
-  if (state.recentTranscript.length < 3) return;
+  // Enforce cooldown — if we fired anything recently, skip
+  if (now - state.lastPromptAt < PROMPT_COOLDOWN_MS) return;
 
   const { broadcastToSession, sendToParticipant, broadcastToAdmins } = require('./websocket');
 
   // Pull material context relevant to recent conversation
-  const recentText = state.recentTranscript.slice(-10).map(u => u.text).join(' ');
+  const recentText = state.recentTranscript.slice(-8).map(u => u.text).join(' ');
   let materialContext = '';
   try {
     const chunks = await retrieveRelevantChunks(sessionId, recentText, 4);
     if (chunks.length > 0) {
-      materialContext = `Relevant course material:\n${chunks.map((c, i) => `[${i+1}] ${c}`).join('\n\n')}`;
+      materialContext = `Relevant course material the students should be engaging with:\n${chunks.map((c, i) => `[${i+1}] ${c}`).join('\n\n')}`;
     }
   } catch (e) {}
 
-  const objectives = state.sessionConfig?.objectives || [];
+  const objectives = (state.sessionConfig?.objectives || []).filter(o => o.trim());
+  const professorPrompts = (state.sessionConfig?.discussion_prompts || []).filter(p => p.trim());
   const interventionRules = state.sessionConfig?.interventions || {};
 
-  // Build participation summary
+  // Build participation summary with timing
   const participantList = Object.entries(state.participantStats)
-    .map(([name, s]) => `${name}: ${s.utteranceCount} contributions, ~${Math.round(s.talkTimeSeconds)}s`)
-    .join('\n');
+    .map(([name, s]) => {
+      const lastSpoke = state.recentTranscript.filter(u => u.speaker === name).slice(-1)[0];
+      const secondsSinceSpoke = lastSpoke ? Math.round((now - lastSpoke.timestamp) / 1000) : null;
+      return `${name}: ${s.utteranceCount} contributions, ~${Math.round(s.talkTimeSeconds)}s talk time${secondsSinceSpoke !== null ? `, last spoke ${secondsSinceSpoke}s ago` : ''}`;
+    }).join('\n');
 
-  // Last 15 utterances with speaker attribution
-  const transcriptWindow = state.recentTranscript.slice(-15)
+  // Recent transcript window
+  const transcriptWindow = state.recentTranscript.slice(-20)
     .map(u => `[${u.speaker}]: ${u.text}`)
     .join('\n');
 
-  // What interventions have already been fired (so Claude doesn't repeat)
-  const firedSummary = state.firedInterventions.slice(-5)
-    .map(f => `${f.target}: "${f.prompt}" (${Math.round((now - f.timestamp) / 1000)}s ago)`)
+  // What's been fired already
+  const recentlyFired = state.firedPrompts.slice(-6)
+    .map(f => `"${f.prompt.slice(0, 80)}" → ${f.target} (${Math.round((now - f.timestamp) / 1000)}s ago)`)
     .join('\n');
 
-  // Which intervention types are enabled by professor
-  const enabledTypes = Object.entries(interventionRules)
-    .filter(([, cfg]) => cfg?.enabled)
+  // Professor's configured prompts as options
+  const professorPromptsText = professorPrompts.length > 0
+    ? `Professor's discussion prompts (use these verbatim or as inspiration — pick the most contextually relevant):\n${professorPrompts.map((p, i) => `${i+1}. ${p}`).join('\n')}`
+    : '';
+
+  // Enabled intervention rules
+  const enabledInterventions = Object.entries(interventionRules)
+    .filter(([, cfg]) => cfg?.enabled && cfg?.prompt)
     .map(([key, cfg]) => `${key}: "${cfg.prompt}"`)
     .join('\n');
 
-  const prompt = `You are an AI discussion facilitator monitoring a live university seminar.
+  const systemPrompt = `You are an AI facilitator monitoring a live university seminar discussion. Your role is to improve discussion quality — deepening thinking, ensuring participation, keeping focus on the topic and learning objectives.
 
-Session topic: ${state.topic || 'General academic discussion'}
+You have two tools:
+1. INDIVIDUAL nudge — sent privately to one student whose contribution needs improvement
+2. GROUP prompt — sent to everyone, used to deepen the whole discussion or redirect it
+
+Use these SPARINGLY. Only intervene when there is a clear, specific reason. A good discussion should flow for several minutes without intervention.`;
+
+  const userPrompt = `Session topic: ${state.topic || 'Academic discussion'}
 ${objectives.length > 0 ? `\nLearning objectives:\n${objectives.map((o, i) => `${i+1}. ${o}`).join('\n')}` : ''}
 
 ${materialContext ? materialContext + '\n' : ''}
 Current participation:
 ${participantList}
 
-Recent conversation (last 15 utterances):
+Recent conversation:
 ${transcriptWindow}
 
-${firedSummary ? `Recent interventions already fired (do not repeat these):\n${firedSummary}\n` : ''}
-${enabledTypes ? `Professor-configured intervention prompts available:\n${enabledTypes}\n` : ''}
+${recentlyFired ? `Already fired (do not repeat or send something too similar):\n${recentlyFired}\n` : ''}
+${professorPromptsText ? `\n${professorPromptsText}\n` : ''}
+${enabledInterventions ? `\nConfigured intervention prompts:\n${enabledInterventions}\n` : ''}
 
-Analyse the discussion quality carefully. Consider:
-1. Is any participant genuinely silent or disengaged (not just waiting their turn)?
-2. Is the discussion actually shallow — are students just agreeing or summarising rather than analysing?
-3. Is the discussion drifting from the learning objectives?
-4. Is one person dominating in a way that's shutting others out?
+Analyse this discussion carefully. Ask yourself:
+- Is someone genuinely silent and disengaged (not just listening)?
+- Is the quality of reasoning shallow — agreement without analysis, summarising without evaluation?
+- Is the discussion drifting away from the topic or objectives?
+- Is someone dominating in a way that prevents others from contributing?
+- Would a specific discussion prompt from the professor's list significantly deepen the conversation right now?
+- OR is the discussion actually going well and needs no intervention?
 
-IMPORTANT RULES:
-- Only intervene if there is a CLEAR and SPECIFIC problem that warrants it
-- If the discussion is flowing well, do NOT intervene — return intervention_needed: false
-- Target interventions at a SPECIFIC individual, never "group" (group prompts are handled separately)
-- Use the professor's configured prompt text if available for the relevant type, otherwise craft one
-- The prompt should feel natural and contextually relevant to what was JUST said — reference the actual conversation
-- Do not repeat a recent intervention
+DECISION RULES:
+- If the discussion is flowing well — return no_action
+- Individual nudge: only for a student who is CLEARLY disengaged or whose contributions are consistently shallow
+- Group prompt: when the WHOLE discussion needs to go deeper, change direction, or engage with a specific concept from the material
+- If using professor's prompts, pick the one most relevant to what was JUST discussed
+- The prompt text must feel like a natural continuation of the conversation — it should reference what was actually just said
+- Never send the same or similar prompt twice
 
-Respond ONLY with valid JSON, no markdown:
-{"intervention_needed":false}
-OR
-{"intervention_needed":true,"type":"<SILENT|DOMINATING|OFF_TOPIC|SHALLOW>","target":"<exact participant name>","prompt":"<contextually relevant prompt text>","reasoning":"<one sentence why this is needed now>"}`;
+Respond ONLY with one of these JSON formats, no markdown:
+
+{"action":"no_action"}
+
+{"action":"individual","target":"<exact participant name>","prompt":"<prompt text contextually relevant to their recent contributions>","type":"<SILENT|SHALLOW|OFF_TOPIC|DOMINATING>","reasoning":"<one sentence>"}
+
+{"action":"group","prompt":"<prompt text>","type":"<DEEPENING|REDIRECT|ENGAGEMENT>","reasoning":"<one sentence>"}`;
 
   try {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 400,
-      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 350,
+      messages: [
+        { role: 'user', content: systemPrompt + '\n\n' + userPrompt }
+      ],
     });
 
     const text = response.content?.[0]?.text?.trim();
@@ -166,115 +204,74 @@ OR
     const clean = text.replace(/```json|```/g, '').trim();
     const result = JSON.parse(clean);
 
-    if (!result.intervention_needed || !result.target || !result.prompt) return;
+    if (!result.action || result.action === 'no_action') {
+      console.log(`[Prompt Engine] No action needed for session ${sessionId}`);
+      return;
+    }
 
-    // Double-check cooldown (in case of concurrent calls)
-    if (Date.now() - state.lastInterventionAt < INTERVENTION_COOLDOWN_MS) return;
+    // Final cooldown check
+    if (Date.now() - state.lastPromptAt < PROMPT_COOLDOWN_MS) return;
 
-    state.lastInterventionAt = Date.now();
-
-    // Record this intervention
-    state.firedInterventions.push({
-      type: result.type,
-      target: result.target,
+    state.lastPromptAt = Date.now();
+    const promptRecord = {
+      action: result.action,
+      target: result.target || 'group',
       prompt: result.prompt,
+      type: result.type,
+      reasoning: result.reasoning,
       timestamp: Date.now(),
-      reasoning: result.reasoning,
-    });
+    };
+    state.firedPrompts.push(promptRecord);
+    if (state.firedPrompts.length > 20) state.firedPrompts.shift();
 
-    // Keep only last 10 interventions in memory
-    if (state.firedInterventions.length > 10) state.firedInterventions.shift();
-
-    console.log(`[Intervention] ${result.type} → ${result.target}: "${result.prompt.slice(0, 60)}..."`);
-
-    // Send targeted prompt to individual student only
-    sendToParticipant(sessionId, result.target, 'AI_PROMPT', {
-      target: result.target,
-      prompt: result.prompt,
-      type: result.type,
-    });
-
-    // Log to admin dashboard (so professor can see what was sent and why)
-    broadcastToAdmins(sessionId, 'INTERVENTION_FIRED', {
-      target: result.target,
-      type: result.type,
-      prompt: result.prompt,
-      reasoning: result.reasoning,
-      timestamp: new Date().toISOString(),
-    });
-
-    // Log to prompts_log for report inclusion
-    try {
-      await supabase.from('prompts_log').insert({
-        session_id: sessionId,
+    if (result.action === 'individual') {
+      console.log(`[Prompt Engine] Individual → ${result.target} (${result.type}): "${result.prompt.slice(0, 60)}..."`);
+      sendToParticipant(sessionId, result.target, 'AI_PROMPT', {
         target: result.target,
-        prompt_text: result.prompt,
-        prompt_type: result.type,
-        issued_by: 'ai_intervention',
-      });
-    } catch (e) {}
-
-  } catch (err) {
-    console.error('[Intervention] Analysis error:', err.message);
-  }
-}
-
-// ─── Schedule professor prompts evenly across session ─────────────────────────
-function scheduleGeneralPrompts(sessionId) {
-  const state = getSessionState(sessionId);
-  const config = state.sessionConfig || {};
-  const prompts = (config.discussion_prompts || []).filter(p => p.trim());
-  const durationMs = (config.duration_minutes || 60) * 60 * 1000;
-
-  if (prompts.length === 0) return;
-
-  // Space prompts evenly — reserve first 5 min and last 5 min
-  const usableMs = durationMs - (10 * 60 * 1000);
-  const intervalMs = Math.max(usableMs / prompts.length, 3 * 60 * 1000); // min 3min between prompts
-
-  console.log(`[Schedule] ${prompts.length} prompts over ${config.duration_minutes}min, interval: ${Math.round(intervalMs/60000)}min`);
-
-  state.scheduledPromptsQueue = prompts;
-  state.nextScheduledPromptIndex = 0;
-
-  // Fire first prompt after 5 minutes, then at intervals
-  let delay = 5 * 60 * 1000;
-  prompts.forEach((p, i) => {
-    setTimeout(() => {
-      const currentState = getSessionState(sessionId);
-      if (!currentState || currentState.nextScheduledPromptIndex !== i) return;
-
-      const { broadcastToSession, broadcastToAdmins } = require('./websocket');
-      console.log(`[Schedule] Firing general prompt ${i+1}: "${p.slice(0, 50)}..."`);
-
-      broadcastToSession(sessionId, 'GENERAL_PROMPT', {
-        prompt: p,
-        target: 'group',
-        index: i + 1,
-        total: prompts.length,
+        prompt: result.prompt,
+        type: result.type,
       });
 
-      broadcastToAdmins(sessionId, 'GENERAL_PROMPT_FIRED', {
-        prompt: p,
-        index: i + 1,
-        total: prompts.length,
+      // Notify admin
+      broadcastToAdmins(sessionId, 'INTERVENTION_FIRED', {
+        target: result.target,
+        type: result.type,
+        prompt: result.prompt,
+        reasoning: result.reasoning,
         timestamp: new Date().toISOString(),
       });
 
-      currentState.nextScheduledPromptIndex = i + 1;
-
-      // Log to prompts_log
-      supabase.from('prompts_log').insert({
-        session_id: sessionId,
+    } else if (result.action === 'group') {
+      console.log(`[Prompt Engine] Group (${result.type}): "${result.prompt.slice(0, 60)}..."`);
+      broadcastToSession(sessionId, 'GENERAL_PROMPT', {
+        prompt: result.prompt,
         target: 'group',
-        prompt_text: p,
-        prompt_type: 'scheduled_general',
-        issued_by: 'system',
-      }).catch(() => {});
+        type: result.type,
+      });
 
-    }, delay + (i * intervalMs));
-  });
+      broadcastToAdmins(sessionId, 'GENERAL_PROMPT_FIRED', {
+        prompt: result.prompt,
+        type: result.type,
+        reasoning: result.reasoning,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Log to DB for report
+    await supabase.from('prompts_log').insert({
+      session_id: sessionId,
+      target: result.target || 'group',
+      prompt_text: result.prompt,
+      prompt_type: result.type || result.action,
+      issued_by: 'ai_engine',
+    }).catch(() => {});
+
+  } catch (err) {
+    console.error('[Prompt Engine] Error:', err.message);
+  }
 }
+
+// ─── Deepgram connection management ──────────────────────────────────────────
 
 async function ensureConnection(sessionId, participantName) {
   const key = getConnectionKey(sessionId, participantName);
@@ -284,7 +281,7 @@ async function ensureConnection(sessionId, participantName) {
 
   const connData = {
     connection: null, buffer: [], isOpen: false,
-    keepAliveInterval: null, interventionInterval: null,
+    keepAliveInterval: null,
   };
   activeConnections.set(key, connData);
 
@@ -317,15 +314,16 @@ async function ensureConnection(sessionId, participantName) {
       try { connection.keepAlive(); } catch (e) {}
     }, 8000);
 
-    // Start intervention analysis on first connection for this session
+    // Start analysis loop on first connection for this session only
     const allKeys = [...activeConnections.keys()].filter(k => k.startsWith(sessionId + '::'));
     if (allKeys.length === 1) {
-      // Run context-aware intervention check every 60 seconds
-      connData.interventionInterval = setInterval(() => {
-        analyseAndIntervene(sessionId).catch(err =>
-          console.error('[Intervention] Error:', err.message)
+      const state = getSessionState(sessionId);
+      state.analysisInterval = setInterval(() => {
+        analyseAndPrompt(sessionId).catch(err =>
+          console.error('[Prompt Engine] Interval error:', err.message)
         );
       }, 60000);
+      console.log(`[Prompt Engine] Analysis loop started for session ${sessionId}`);
     }
   });
 
@@ -348,7 +346,7 @@ async function ensureConnection(sessionId, participantName) {
     await supabase.from('transcripts').insert({
       session_id: sessionId,
       speaker_name: speakerTag,
-      utterance: utterance,
+      utterance,
       timestamp_seconds: 0,
     });
 
@@ -359,9 +357,8 @@ async function ensureConnection(sessionId, participantName) {
     state.participantStats[speakerTag].utteranceCount += 1;
     state.participantStats[speakerTag].talkTimeSeconds += utterance.split(' ').length * 0.4;
 
-    // Store full text in recent transcript for intervention analysis
     state.recentTranscript.push({ speaker: speakerTag, text: utterance, timestamp: Date.now() });
-    if (state.recentTranscript.length > 30) state.recentTranscript.shift();
+    if (state.recentTranscript.length > 40) state.recentTranscript.shift();
 
     const { broadcastToAdmins } = require('./websocket');
     broadcastToAdmins(sessionId, 'NEW_UTTERANCE', {
@@ -385,7 +382,6 @@ async function ensureConnection(sessionId, participantName) {
     console.log(`[Deepgram] Connection CLOSED for ${participantName}`);
     connData.isOpen = false;
     if (connData.keepAliveInterval) clearInterval(connData.keepAliveInterval);
-    if (connData.interventionInterval) clearInterval(connData.interventionInterval);
     activeConnections.delete(key);
   });
 
@@ -397,11 +393,8 @@ async function scoreAndBroadcast(sessionId, state, speakerTag, batch) {
     const { scoreUtterance } = require('./scoring');
     const { broadcastToAdmins } = require('./websocket');
     const scoreResult = await scoreUtterance(sessionId, speakerTag, batch, state.topic, state.sessionConfig);
-    if (!scoreResult) {
-      console.warn(`[Scoring] No result for ${speakerTag} — batch dropped`);
-      return;
-    }
-    await updateParticipantScore(sessionId, speakerTag, scoreResult, state);
+    if (!scoreResult) return;
+    await updateParticipantScore(sessionId, speakerTag, scoreResult);
     broadcastToAdmins(sessionId, 'SCORE_UPDATE', {
       speakerTag, scores: scoreResult.scores,
       bloom_level: scoreResult.bloom_level,
@@ -413,7 +406,7 @@ async function scoreAndBroadcast(sessionId, state, speakerTag, batch) {
   }
 }
 
-async function updateParticipantScore(sessionId, speakerTag, scoreResult, state) {
+async function updateParticipantScore(sessionId, speakerTag, scoreResult) {
   try {
     const { data: existing } = await supabase.from('scores').select('*')
       .eq('session_id', sessionId).eq('speaker_tag', speakerTag).single();
@@ -427,7 +420,8 @@ async function updateParticipantScore(sessionId, speakerTag, scoreResult, state)
         depth: avg(existing.depth, scores.depth),
         material_application: avg(existing.material_application, scores.material_application),
         overall_score: avg(existing.overall_score, scores.overall_score),
-        bloom_level: bloomLevel, utterance_count: n + 1,
+        bloom_level: bloomLevel,
+        utterance_count: n + 1,
       }).eq('id', existing.id);
     } else {
       await supabase.from('scores').insert({
@@ -458,18 +452,24 @@ async function stopTranscription(sessionId) {
   console.log(`[Transcription] Stopping all connections for session ${sessionId}`);
   const keysToClose = [...activeConnections.keys()].filter(k => k.startsWith(sessionId + '::'));
 
+  // Stop analysis interval
+  const state = sessionState.get(sessionId);
+  if (state?.analysisInterval) {
+    clearInterval(state.analysisInterval);
+    state.analysisInterval = null;
+  }
+
   for (const key of keysToClose) {
     const connData = activeConnections.get(key);
     if (!connData) continue;
     const participantName = key.split('::')[1];
-    const state = getSessionState(sessionId);
-    if (state.utteranceBuffer[participantName]?.length > 0) {
-      const batch = state.utteranceBuffer[participantName].join(' ');
-      state.utteranceBuffer[participantName] = [];
-      await scoreAndBroadcast(sessionId, state, participantName, batch);
+    const s = getSessionState(sessionId);
+    if (s.utteranceBuffer[participantName]?.length > 0) {
+      const batch = s.utteranceBuffer[participantName].join(' ');
+      s.utteranceBuffer[participantName] = [];
+      await scoreAndBroadcast(sessionId, s, participantName, batch);
     }
     if (connData.keepAliveInterval) clearInterval(connData.keepAliveInterval);
-    if (connData.interventionInterval) clearInterval(connData.interventionInterval);
     try { connData.connection.finish(); } catch (e) {}
     activeConnections.delete(key);
   }
@@ -479,29 +479,22 @@ async function stopTranscription(sessionId) {
   console.log(`[Transcription] All connections closed for session ${sessionId}`);
 }
 
-// startTranscription: caches config and schedules general prompts
 function startTranscription(sessionId, topic, sessionConfig) {
   console.log(`[Transcription] Session ${sessionId} ready`);
   const state = getSessionState(sessionId);
   if (topic) state.topic = topic;
-  if (sessionConfig) {
-    state.sessionConfig = sessionConfig;
-    // Schedule professor's discussion prompts
-    scheduleGeneralPrompts(sessionId);
-  }
+  if (sessionConfig) state.sessionConfig = sessionConfig;
+  // No timer scheduling here — analysis loop starts when first participant connects
 }
 
 function getSessionStats(sessionId) {
   const state = sessionState.get(sessionId);
-  if (!state) return {};
-  return state.participantStats;
+  return state?.participantStats || {};
 }
 
-// Returns intervention log for report inclusion
 function getInterventionLog(sessionId) {
   const state = sessionState.get(sessionId);
-  if (!state) return [];
-  return state.firedInterventions || [];
+  return state?.firedPrompts || [];
 }
 
 module.exports = { sendAudioChunk, startTranscription, stopTranscription, getSessionStats, getInterventionLog };
