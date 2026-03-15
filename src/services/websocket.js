@@ -44,7 +44,6 @@ function updateParticipantRMS(sessionId, participantName, rawRMS, manualOverride
     lastUpdate: now,
     lastSpeakingAt: snr > SNR_SPEECH_THRESHOLD ? now : existing.lastSpeakingAt,
   });
-
   return rmsMap.get(participantName);
 }
 
@@ -105,7 +104,7 @@ function electActiveSpeaker(sessionId) {
   if (ratio < SNR_DOMINANCE_RATIO) {
     const currentStillSpeaking = speaking.find(c => c.name === current);
     if (!currentStillSpeaking) {
-      console.log(`[RMS] Speaker → ${top.name} (current gone silent, snr=${top.snr.toFixed(2)})`);
+      console.log(`[RMS] Speaker → ${top.name} (current gone silent)`);
       activeSpeakers.set(sessionId, top.name);
       speakerLockUntil.set(sessionId, now + SPEAKER_LOCK_MS);
       return top.name;
@@ -114,7 +113,7 @@ function electActiveSpeaker(sessionId) {
   }
 
   if (top.name !== current) {
-    console.log(`[RMS] Speaker → ${top.name} (snr=${top.snr.toFixed(2)}, ratio=${ratio.toFixed(2)}, floor=${top.noiseFloor.toFixed(4)})`);
+    console.log(`[RMS] Speaker → ${top.name} (snr=${top.snr.toFixed(2)}, ratio=${ratio.toFixed(2)})`);
     activeSpeakers.set(sessionId, top.name);
     speakerLockUntil.set(sessionId, now + SPEAKER_LOCK_MS);
   }
@@ -136,6 +135,7 @@ function initWebSocket(server) {
     ws._participantName = participantName;
     ws._type = type;
 
+    // ── Audio stream connection ──────────────────────────────────────────────
     if (type === 'audio') {
       const rmsMap = getSessionRMS(sessionId);
       rmsMap.set(participantName, {
@@ -180,7 +180,7 @@ function initWebSocket(server) {
       sessionClients.get(sessionId).add(ws);
 
       // Send opening question immediately to this participant on connect.
-      // Handles late joiners — they don't miss the broadcast that fired at session start.
+      // Handles BOTH on-time joiners (session just started) and late joiners.
       if (role === 'participant' && participantName && participantName !== 'unknown') {
         try {
           const { getSessionInfo } = require('./transcription');
