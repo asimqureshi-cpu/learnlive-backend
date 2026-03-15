@@ -13,27 +13,74 @@ const recentUtterances = new Map();
 const DEDUP_WINDOW_MS = 3000;
 const DEDUP_SIMILARITY = 0.85;
 
-// ─── Minimum gap between ANY prompt (group or individual) ─────────────────────
-// Prevents flooding. After a prompt fires, nothing fires for 60s.
-const PROMPT_COOLDOWN_MS = 60000;
+// ─── Session phases (as % of total duration) ─────────────────────────────────
+const PHASE = {
+  JOIN_WINDOW:   { start: 0,   end: 5   },  // 0–5%:  join, no nudges, send opening Q on connect
+  WARMUP:        { start: 5,   end: 15  },  // 5–15%: light prompts only, get everyone talking
+  MAIN:          { start: 15,  end: 75  },  // 15–75%: full nudge + prompt engine
+  DEEPENING:     { start: 75,  end: 90  },  // 75–90%: quality focus, no participation nudges
+  CLOSE:         { start: 90,  end: 100 },  // 90–100%: wrap-up prompt, no nudges
+};
 
-// ─── Minimum utterances before we attempt analysis ────────────────────────────
-const MIN_UTTERANCES_FOR_ANALYSIS = 2;
+// ─── Nudge thresholds ─────────────────────────────────────────────────────────
+const SILENCE_LAYER1_MS = 90 * 1000;         // 90s silence → Layer 1 nudge
+const SHALLOW_BATCHES_THRESHOLD = 2;          // 2 consecutive shallow batches → nudge
+const LOW_TOPIC_ADHERENCE = 4;                // below 4/10 topic adherence → off-topic nudge
+const MAX_NUDGES_PER_STUDENT = 2;             // max nudges per student per session
+const LAYER2_COOLDOWN_MS = 3 * 60 * 1000;    // 3 min between Layer 2 nudges per student
+const GROUP_PROMPT_COOLDOWN_MS = 3 * 60 * 1000; // 3 min between group prompts
 
 function getSessionState(sessionId) {
   if (!sessionState.has(sessionId)) {
     sessionState.set(sessionId, {
       topic: null,
       sessionConfig: {},
-      participantStats: {},
-      recentTranscript: [],     // { speaker, text, timestamp } — last 40 utterances
+      openingQuestion: null,         // stored so late joiners can receive it
+      sessionStartedAt: null,        // set when startTranscription is called
+      participantStats: {},          // { [name]: { utteranceCount, talkTimeSeconds } }
+      recentTranscript: [],          // last 40 { speaker, text, timestamp, scores }
       utteranceBuffer: {},
-      firedPrompts: [],         // all prompts fired this session for dedup/report
-      lastPromptAt: 0,          // timestamp of last prompt fired (any type)
+      firedPrompts: [],              // all prompts/nudges fired this session
+      lastGroupPromptAt: 0,
+      studentState: {},              // per-student nudge state (see initStudentState)
       analysisInterval: null,
     });
   }
   return sessionState.get(sessionId);
+}
+
+function initStudentState() {
+  return {
+    nudgeCount: 0,
+    layer1FiredAt: null,
+    layer2FiredAt: null,
+    maxNudgesReached: false,
+    lastSpokeAt: null,
+    recentBatchScores: [],     // last 3 batch overall scores
+    recentTopicScores: [],     // last 3 topic_adherence scores
+    consecutiveShallowBatches: 0,
+  };
+}
+
+function getStudentState(state, name) {
+  if (!state.studentState[name]) state.studentState[name] = initStudentState();
+  return state.studentState[name];
+}
+
+// Returns session elapsed % (0–100)
+function getSessionPct(state) {
+  if (!state.sessionStartedAt) return 0;
+  const durationMs = (state.sessionConfig?.duration_minutes || 60) * 60 * 1000;
+  const elapsed = Date.now() - state.sessionStartedAt;
+  return Math.min(100, (elapsed / durationMs) * 100);
+}
+
+function getCurrentPhase(pct) {
+  if (pct < PHASE.JOIN_WINDOW.end) return 'JOIN_WINDOW';
+  if (pct < PHASE.WARMUP.end) return 'WARMUP';
+  if (pct < PHASE.MAIN.end) return 'MAIN';
+  if (pct < PHASE.DEEPENING.end) return 'DEEPENING';
+  return 'CLOSE';
 }
 
 function getConnectionKey(sessionId, participantName) {
@@ -60,221 +107,326 @@ function isDuplicate(sessionId, participantName, utterance, currentSNR) {
     const similarity = stringSimilarity(utterance, prev.text);
     if (similarity >= DEDUP_SIMILARITY) {
       if (currentSNR >= prev.snr) { prev.superseded = true; return false; }
-      else { return true; }
+      return true;
     }
   }
   fresh.push({ text: utterance, participantName, timestamp: now, snr: currentSNR });
   return false;
 }
 
-// ─── Unified context-aware prompt engine ─────────────────────────────────────
-//
-// This is the single place where ALL prompts are decided. It runs every 60s.
-// Claude reads:
-//   - Full recent transcript (last 20 utterances)
-//   - Participation stats (who spoke, how much)
-//   - Relevant material chunks from RAG
-//   - Session objectives
-//   - Professor's configured prompts (as reference/options, not fixed)
-//   - Already-fired prompts (to avoid repeats)
-//
-// Claude decides:
-//   A) No intervention needed — say nothing
-//   B) Individual nudge needed — targeted to one student, personal card
-//   C) Group prompt needed — broadcast to all, from professor list or Claude-generated
-//
-// The 60s cooldown applies to ALL outcomes B and C combined.
-//
-async function analyseAndPrompt(sessionId) {
+// ─── PROMPT SCHEDULER ─────────────────────────────────────────────────────────
+// Pure logic — no Claude call. Fires professor's discussion prompts to the group
+// based on session phase and timing. Completely separate from the nudge engine.
+function checkPromptScheduler(sessionId) {
   const state = getSessionState(sessionId);
-  if (!state) return;
+  if (!state.sessionStartedAt) return;
 
-  // Not enough data yet
-  if (state.recentTranscript.length < MIN_UTTERANCES_FOR_ANALYSIS) return;
-  if (Object.keys(state.participantStats).length === 0) return;
+  const pct = getSessionPct(state);
+  const phase = getCurrentPhase(pct);
+  const now = Date.now();
+  const prompts = (state.sessionConfig?.discussion_prompts || []).filter(p => p.trim());
 
+  if (prompts.length === 0) return;
+  if (phase === 'JOIN_WINDOW' || phase === 'CLOSE') return;
+  if (now - state.lastGroupPromptAt < GROUP_PROMPT_COOLDOWN_MS) return;
+
+  // Calculate which prompt index should fire based on session percentage
+  // Distribute prompts evenly across WARMUP + MAIN + DEEPENING (5%–90%)
+  const usableRange = 85; // 90 - 5
+  const promptInterval = usableRange / prompts.length;
+  const expectedIndex = Math.floor((pct - 5) / promptInterval);
+  const clampedIndex = Math.min(expectedIndex, prompts.length - 1);
+
+  // Count how many have already been fired as group prompts
+  const firedGroupPrompts = state.firedPrompts.filter(p => p.type === 'GROUP_PROMPT').length;
+
+  if (firedGroupPrompts <= clampedIndex) {
+    const prompt = prompts[firedGroupPrompts];
+    if (!prompt) return;
+
+    const { broadcastToSession, broadcastToAdmins } = require('./websocket');
+    console.log(`[Prompt Scheduler] Phase ${phase} (${pct.toFixed(0)}%) — firing prompt ${firedGroupPrompts + 1}/${prompts.length}`);
+
+    broadcastToSession(sessionId, 'GENERAL_PROMPT', {
+      prompt,
+      target: 'group',
+      type: 'GROUP_PROMPT',
+      index: firedGroupPrompts + 1,
+      total: prompts.length,
+    });
+
+    broadcastToAdmins(sessionId, 'GENERAL_PROMPT_FIRED', {
+      prompt,
+      index: firedGroupPrompts + 1,
+      total: prompts.length,
+      phase,
+      timestamp: new Date().toISOString(),
+    });
+
+    state.lastGroupPromptAt = now;
+    state.firedPrompts.push({ type: 'GROUP_PROMPT', prompt, target: 'group', timestamp: now });
+
+    supabase.from('prompts_log').insert({
+      session_id: sessionId, target: 'group',
+      prompt_text: prompt, prompt_type: 'scheduled_group', issued_by: 'system',
+    }).then().catch(() => {});
+  }
+}
+
+// ─── NUDGE ENGINE ─────────────────────────────────────────────────────────────
+// Condition-gated. Claude is only called when a specific student has crossed
+// a measurable threshold. Layer 1 = no RAG, fast. Layer 2 = RAG + full context.
+async function checkNudgeEngine(sessionId) {
+  const state = getSessionState(sessionId);
+  if (!state.sessionStartedAt) return;
+
+  const pct = getSessionPct(state);
+  const phase = getCurrentPhase(pct);
+  const now = Date.now();
+  const participants = Object.keys(state.participantStats);
+  if (participants.length === 0) return;
+
+  // No nudges in JOIN_WINDOW or CLOSE
+  if (phase === 'JOIN_WINDOW' || phase === 'CLOSE') return;
+
+  const { sendToParticipant, broadcastToAdmins } = require('./websocket');
+
+  // Calculate fair share of silence — a student silent for 1.5x their fair share needs a nudge
+  const elapsedMs = Date.now() - state.sessionStartedAt;
+  const fairShareMs = elapsedMs / participants.length;
+  const silenceThresholdMs = Math.max(SILENCE_LAYER1_MS, fairShareMs * 1.5);
+
+  for (const name of participants) {
+    const stu = getStudentState(state, name);
+    if (stu.maxNudgesReached) continue;
+
+    // ── Condition 1: SILENCE ──────────────────────────────────────────────────
+    const silentFor = stu.lastSpokeAt ? now - stu.lastSpokeAt : elapsedMs;
+    const isSilent = silentFor > silenceThresholdMs;
+
+    // In DEEPENING phase, don't nudge for silence — too late
+    if (isSilent && phase !== 'DEEPENING') {
+      if (!stu.layer1FiredAt) {
+        // Layer 1 — no Claude needed, fire immediately
+        await fireNudge(sessionId, name, 'LAYER1_SILENCE', null, state, stu);
+        continue;
+      } else if (!stu.layer2FiredAt && now - stu.layer1FiredAt > 60000) {
+        // Layer 2 — still silent after Layer 1, use Claude + material context
+        await fireNudgeLayer2(sessionId, name, 'SILENT', state, stu);
+        continue;
+      }
+    }
+
+    // ── Condition 2: SHALLOW REASONING ───────────────────────────────────────
+    // Only in MAIN and DEEPENING phases where quality matters
+    if ((phase === 'MAIN' || phase === 'DEEPENING') && stu.consecutiveShallowBatches >= SHALLOW_BATCHES_THRESHOLD) {
+      if (!stu.layer1FiredAt || (now - stu.layer1FiredAt > 120000)) {
+        await fireNudge(sessionId, name, 'LAYER1_SHALLOW', null, state, stu);
+        continue;
+      } else if (!stu.layer2FiredAt && now - stu.layer1FiredAt > 90000) {
+        await fireNudgeLayer2(sessionId, name, 'SHALLOW', state, stu);
+        continue;
+      }
+    }
+
+    // ── Condition 3: OFF-TOPIC ────────────────────────────────────────────────
+    if (phase === 'MAIN' || phase === 'DEEPENING') {
+      const recentTopicAvg = stu.recentTopicScores.length > 0
+        ? stu.recentTopicScores.reduce((a, b) => a + b, 0) / stu.recentTopicScores.length
+        : null;
+      if (recentTopicAvg !== null && recentTopicAvg < LOW_TOPIC_ADHERENCE && stu.recentTopicScores.length >= 2) {
+        if (!stu.layer1FiredAt || now - stu.layer1FiredAt > 120000) {
+          await fireNudge(sessionId, name, 'LAYER1_OFF_TOPIC', null, state, stu);
+          continue;
+        } else if (!stu.layer2FiredAt && now - stu.layer1FiredAt > 90000) {
+          await fireNudgeLayer2(sessionId, name, 'OFF_TOPIC', state, stu);
+          continue;
+        }
+      }
+    }
+  }
+
+  // ── CLOSE phase: one wrap-up group prompt ─────────────────────────────────
+  if (phase === 'CLOSE') {
+    const alreadyFiredClose = state.firedPrompts.some(p => p.type === 'CLOSE_PROMPT');
+    if (!alreadyFiredClose) {
+      const { broadcastToSession } = require('./websocket');
+      const closePrompt = "We're in the final minutes. Can someone summarise the key point of disagreement in the group — and what evidence would change your position?";
+      broadcastToSession(sessionId, 'GENERAL_PROMPT', {
+        prompt: closePrompt, target: 'group', type: 'CLOSE_PROMPT',
+      });
+      broadcastToAdmins(sessionId, 'GENERAL_PROMPT_FIRED', {
+        prompt: closePrompt, type: 'CLOSE_PROMPT', timestamp: new Date().toISOString(),
+      });
+      state.firedPrompts.push({ type: 'CLOSE_PROMPT', prompt: closePrompt, target: 'group', timestamp: now });
+      console.log(`[Nudge Engine] Close prompt fired for session ${sessionId}`);
+    }
+  }
+}
+
+// ─── Layer 1 nudge — no Claude, pure logic, contextually selected ─────────────
+async function fireNudge(sessionId, studentName, conditionType, context, state, stu) {
+  const interventionRules = state.sessionConfig?.interventions || {};
+  const topic = state.topic || 'the topic';
+  const { sendToParticipant, broadcastToAdmins } = require('./websocket');
+
+  let prompt;
+  let nudgeType;
+
+  if (conditionType === 'LAYER1_SILENCE') {
+    nudgeType = 'SILENT';
+    // Use professor's configured silence prompt if available, otherwise generate
+    const configured = interventionRules.silence?.enabled && interventionRules.silence?.prompt;
+    prompt = configured || `We haven't heard from you yet, ${studentName} — what's your initial reaction to this?`;
+  } else if (conditionType === 'LAYER1_SHALLOW') {
+    nudgeType = 'SHALLOW';
+    const configured = interventionRules.shallow?.enabled && interventionRules.shallow?.prompt;
+    // Personalise with last utterance if available
+    const lastUtterance = state.recentTranscript.filter(u => u.speaker === studentName).slice(-1)[0];
+    if (configured) {
+      prompt = configured;
+    } else if (lastUtterance) {
+      prompt = `You mentioned "${lastUtterance.text.slice(0, 60)}..." — can you take that further? What does the framework suggest about why that happens?`;
+    } else {
+      prompt = `Good start — can you push that analysis a level deeper? What's the underlying mechanism here?`;
+    }
+  } else if (conditionType === 'LAYER1_OFF_TOPIC') {
+    nudgeType = 'OFF_TOPIC';
+    const configured = interventionRules.offTopic?.enabled && interventionRules.offTopic?.prompt;
+    prompt = configured || `Interesting point — how does that connect back to ${topic}? Try to ground it in the material.`;
+  } else {
+    return;
+  }
+
+  stu.nudgeCount += 1;
+  stu.layer1FiredAt = Date.now();
+  if (stu.nudgeCount >= MAX_NUDGES_PER_STUDENT) stu.maxNudgesReached = true;
+
+  state.firedPrompts.push({ type: nudgeType, target: studentName, prompt, timestamp: Date.now(), layer: 1 });
+
+  console.log(`[Nudge L1] ${nudgeType} → ${studentName}: "${prompt.slice(0, 60)}..."`);
+
+  sendToParticipant(sessionId, studentName, 'AI_PROMPT', {
+    target: studentName, prompt, type: nudgeType,
+  });
+
+  broadcastToAdmins(sessionId, 'INTERVENTION_FIRED', {
+    target: studentName, type: nudgeType, prompt,
+    layer: 1, timestamp: new Date().toISOString(),
+  });
+
+  try {
+    await supabase.from('prompts_log').insert({
+      session_id: sessionId, target: studentName,
+      prompt_text: prompt, prompt_type: nudgeType, issued_by: 'ai_layer1',
+    });
+  } catch (e) {}
+}
+
+// ─── Layer 2 nudge — Claude + RAG, contextually grounded ─────────────────────
+async function fireNudgeLayer2(sessionId, studentName, conditionType, state, stu) {
   const now = Date.now();
 
-  // Enforce cooldown — if we fired anything recently, skip
-  if (now - state.lastPromptAt < PROMPT_COOLDOWN_MS) return;
+  // Layer 2 cooldown per student
+  if (stu.layer2FiredAt && now - stu.layer2FiredAt < LAYER2_COOLDOWN_MS) return;
 
-  const { broadcastToSession, sendToParticipant, broadcastToAdmins } = require('./websocket');
+  const { sendToParticipant, broadcastToAdmins } = require('./websocket');
 
-  // Pull material context relevant to recent conversation
-  const recentText = state.recentTranscript.slice(-8).map(u => u.text).join(' ');
+  // Pull material context relevant to what the student was last discussing
+  const studentUtterances = state.recentTranscript.filter(u => u.speaker === studentName).slice(-5);
+  const studentText = studentUtterances.map(u => u.text).join(' ');
   let materialContext = '';
   try {
-    const chunks = await retrieveRelevantChunks(sessionId, recentText, 4);
+    const chunks = await retrieveRelevantChunks(sessionId, studentText || state.topic, 3);
     if (chunks.length > 0) {
-      materialContext = `Relevant course material the students should be engaging with:\n${chunks.map((c, i) => `[${i+1}] ${c}`).join('\n\n')}`;
+      materialContext = `Relevant material:\n${chunks.map((c, i) => `[${i+1}] ${c}`).join('\n\n')}`;
     }
   } catch (e) {}
 
-  const objectives = (state.sessionConfig?.objectives || []).filter(o => o.trim());
+  const objectives = (state.sessionConfig?.objectives || []).join('; ');
+  const studentTranscriptText = studentUtterances.map(u => `"${u.text}"`).join('\n');
   const professorPrompts = (state.sessionConfig?.discussion_prompts || []).filter(p => p.trim());
-  const interventionRules = state.sessionConfig?.interventions || {};
 
-  // Build participation summary with timing
-  const participantList = Object.entries(state.participantStats)
-    .map(([name, s]) => {
-      const lastSpoke = state.recentTranscript.filter(u => u.speaker === name).slice(-1)[0];
-      const secondsSinceSpoke = lastSpoke ? Math.round((now - lastSpoke.timestamp) / 1000) : null;
-      return `${name}: ${s.utteranceCount} contributions, ~${Math.round(s.talkTimeSeconds)}s talk time${secondsSinceSpoke !== null ? `, last spoke ${secondsSinceSpoke}s ago` : ''}`;
-    }).join('\n');
+  const conditionExplanation = {
+    SILENT: `${studentName} has not spoken for an unusually long time despite other discussion happening.`,
+    SHALLOW: `${studentName}'s last ${SHALLOW_BATCHES_THRESHOLD} scored contributions were at REMEMBER or UNDERSTAND level — summarising without analysis.`,
+    OFF_TOPIC: `${studentName}'s recent contributions have had consistently low topic adherence scores.`,
+  }[conditionType];
 
-  // Recent transcript window
-  const transcriptWindow = state.recentTranscript.slice(-20)
-    .map(u => `[${u.speaker}]: ${u.text}`)
-    .join('\n');
+  const prompt = `You are an AI discussion facilitator. Write a single targeted nudge prompt for one student.
 
-  // What's been fired already
-  const recentlyFired = state.firedPrompts.slice(-6)
-    .map(f => `"${f.prompt.slice(0, 80)}" → ${f.target} (${Math.round((now - f.timestamp) / 1000)}s ago)`)
-    .join('\n');
+Session topic: ${state.topic}
+${objectives ? `Learning objectives: ${objectives}` : ''}
 
-  // Professor's configured prompts as options
-  const professorPromptsText = professorPrompts.length > 0
-    ? `Professor's discussion prompts (use these verbatim or as inspiration — pick the most contextually relevant):\n${professorPrompts.map((p, i) => `${i+1}. ${p}`).join('\n')}`
-    : '';
+${materialContext}
 
-  // Enabled intervention rules
-  const enabledInterventions = Object.entries(interventionRules)
-    .filter(([, cfg]) => cfg?.enabled && cfg?.prompt)
-    .map(([key, cfg]) => `${key}: "${cfg.prompt}"`)
-    .join('\n');
+Student's recent contributions:
+${studentTranscriptText || '(none)'}
 
-  const systemPrompt = `You are an AI facilitator monitoring a live university seminar discussion. Your role is to improve discussion quality — deepening thinking, ensuring participation, keeping focus on the topic and learning objectives.
+Condition: ${conditionExplanation}
 
-You have two tools:
-1. INDIVIDUAL nudge — sent privately to one student whose contribution needs improvement
-2. GROUP prompt — sent to everyone, used to deepen the whole discussion or redirect it
+${professorPrompts.length > 0 ? `Professor's discussion prompts for inspiration (do not copy verbatim):\n${professorPrompts.map((p, i) => `${i+1}. ${p}`).join('\n')}` : ''}
 
-Use these SPARINGLY. Only intervene when there is a clear, specific reason. A good discussion should flow for several minutes without intervention.`;
+Write ONE nudge prompt for ${studentName} that:
+- References something specific from their recent contributions OR from the material
+- Pushes them toward APPLY, ANALYSE, or EVALUATE level thinking
+- Feels like a natural facilitator question, not a rebuke
+- Is 1-2 sentences maximum
+- Is directly relevant to the course material shown above
 
-  const userPrompt = `Session topic: ${state.topic || 'Academic discussion'}
-${objectives.length > 0 ? `\nLearning objectives:\n${objectives.map((o, i) => `${i+1}. ${o}`).join('\n')}` : ''}
-
-${materialContext ? materialContext + '\n' : ''}
-Current participation:
-${participantList}
-
-Recent conversation:
-${transcriptWindow}
-
-${recentlyFired ? `Already fired (do not repeat or send something too similar):\n${recentlyFired}\n` : ''}
-${professorPromptsText ? `\n${professorPromptsText}\n` : ''}
-${enabledInterventions ? `\nConfigured intervention prompts:\n${enabledInterventions}\n` : ''}
-
-Analyse this discussion carefully. Focus on CONTENT QUALITY, not just who spoke.
-
-Key questions:
-1. Is the student only summarising/recalling the paper without analysing or evaluating it? (SHALLOW — most common problem)
-2. Is the student drifting from the topic or failing to connect their points to the learning objectives?
-3. Is the student not applying frameworks from the material to their examples?
-4. Is the discussion actually going well — student is analysing, evaluating, applying concepts critically?
-
-DECISION RULES:
-- NEVER fire DOMINATING if there is only one participant — it makes no sense
-- NEVER fire SILENT if the student just spoke in the last 30 seconds
-- Fire SHALLOW when student is only recalling/summarising without analysis or critical evaluation
-- Fire OFF_TOPIC when student's example or point doesn't connect back to the material or objectives
-- Fire a GROUP prompt (DEEPENING) when the student needs to go deeper using specific concepts from the material
-- If the student is doing well — return no_action
-- The prompt MUST reference what the student actually just said — be specific, not generic
-- Prefer using the professor's prompts as a base, adapted to be contextually relevant to what was just said
-- Never send the same or similar prompt twice
-
-Respond ONLY with one of these JSON formats, no markdown:
-
-{"action":"no_action"}
-
-{"action":"individual","target":"<exact participant name>","prompt":"<prompt text contextually relevant to their recent contributions>","type":"<SILENT|SHALLOW|OFF_TOPIC|DOMINATING>","reasoning":"<one sentence>"}
-
-{"action":"group","prompt":"<prompt text>","type":"<DEEPENING|REDIRECT|ENGAGEMENT>","reasoning":"<one sentence>"}`;
+Respond ONLY with the prompt text, no JSON, no preamble.`;
 
   try {
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 350,
-      messages: [
-        { role: 'user', content: systemPrompt + '\n\n' + userPrompt }
-      ],
+      max_tokens: 150,
+      messages: [{ role: 'user', content: prompt }],
     });
 
-    const text = response.content?.[0]?.text?.trim();
-    if (!text) return;
+    const nudgeText = response.content?.[0]?.text?.trim();
+    if (!nudgeText) return;
 
-    const clean = text.replace(/```json|```/g, '').trim();
-    const result = JSON.parse(clean);
+    stu.nudgeCount += 1;
+    stu.layer2FiredAt = now;
+    if (stu.nudgeCount >= MAX_NUDGES_PER_STUDENT) stu.maxNudgesReached = true;
 
-    if (!result.action || result.action === 'no_action') {
-      console.log(`[Prompt Engine] No action needed for session ${sessionId}`);
-      return;
-    }
+    state.firedPrompts.push({ type: conditionType, target: studentName, prompt: nudgeText, timestamp: now, layer: 2 });
 
-    // Final cooldown check
-    if (Date.now() - state.lastPromptAt < PROMPT_COOLDOWN_MS) return;
+    console.log(`[Nudge L2] ${conditionType} → ${studentName}: "${nudgeText.slice(0, 60)}..."`);
 
-    state.lastPromptAt = Date.now();
-    const promptRecord = {
-      action: result.action,
-      target: result.target || 'group',
-      prompt: result.prompt,
-      type: result.type,
-      reasoning: result.reasoning,
-      timestamp: Date.now(),
-    };
-    state.firedPrompts.push(promptRecord);
-    if (state.firedPrompts.length > 20) state.firedPrompts.shift();
+    sendToParticipant(sessionId, studentName, 'AI_PROMPT', {
+      target: studentName, prompt: nudgeText, type: conditionType,
+    });
 
-    if (result.action === 'individual') {
-      console.log(`[Prompt Engine] Individual → ${result.target} (${result.type}): "${result.prompt.slice(0, 60)}..."`);
-      sendToParticipant(sessionId, result.target, 'AI_PROMPT', {
-        target: result.target,
-        prompt: result.prompt,
-        type: result.type,
-      });
+    broadcastToAdmins(sessionId, 'INTERVENTION_FIRED', {
+      target: studentName, type: conditionType, prompt: nudgeText,
+      layer: 2, timestamp: new Date().toISOString(),
+    });
 
-      // Notify admin
-      broadcastToAdmins(sessionId, 'INTERVENTION_FIRED', {
-        target: result.target,
-        type: result.type,
-        prompt: result.prompt,
-        reasoning: result.reasoning,
-        timestamp: new Date().toISOString(),
-      });
-
-    } else if (result.action === 'group') {
-      console.log(`[Prompt Engine] Group (${result.type}): "${result.prompt.slice(0, 60)}..."`);
-      broadcastToSession(sessionId, 'GENERAL_PROMPT', {
-        prompt: result.prompt,
-        target: 'group',
-        type: result.type,
-      });
-
-      broadcastToAdmins(sessionId, 'GENERAL_PROMPT_FIRED', {
-        prompt: result.prompt,
-        type: result.type,
-        reasoning: result.reasoning,
-        timestamp: new Date().toISOString(),
-      });
-    }
-
-    // Log to DB for report
     try {
       await supabase.from('prompts_log').insert({
-        session_id: sessionId,
-        target: result.target || 'group',
-        prompt_text: result.prompt,
-        prompt_type: result.type || result.action,
-        issued_by: 'ai_engine',
+        session_id: sessionId, target: studentName,
+        prompt_text: nudgeText, prompt_type: conditionType, issued_by: 'ai_layer2',
       });
-    } catch (logErr) {
-      console.warn('[Prompt Engine] DB log failed (non-fatal):', logErr.message);
-    }
+    } catch (e) {}
 
   } catch (err) {
-    console.error('[Prompt Engine] Error:', err.message);
+    console.error('[Nudge L2] Claude error:', err.message);
+  }
+}
+
+// ─── Main analysis loop ───────────────────────────────────────────────────────
+// Runs every 30s. Two separate systems: prompt scheduler (pure logic) + nudge engine (condition-gated).
+async function runAnalysis(sessionId) {
+  try {
+    checkPromptScheduler(sessionId);
+  } catch (e) {
+    console.error('[Prompt Scheduler] Error:', e.message);
+  }
+  try {
+    await checkNudgeEngine(sessionId);
+  } catch (e) {
+    console.error('[Nudge Engine] Error:', e.message);
   }
 }
 
@@ -286,10 +438,7 @@ async function ensureConnection(sessionId, participantName) {
 
   console.log(`[Deepgram] Opening connection for ${participantName} in session ${sessionId}`);
 
-  const connData = {
-    connection: null, buffer: [], isOpen: false,
-    keepAliveInterval: null,
-  };
+  const connData = { connection: null, buffer: [], isOpen: false, keepAliveInterval: null };
   activeConnections.set(key, connData);
 
   const state = getSessionState(sessionId);
@@ -298,6 +447,9 @@ async function ensureConnection(sessionId, participantName) {
       const { data } = await supabase.from('sessions').select('topic, session_config').eq('id', sessionId).single();
       state.topic = data?.topic || '';
       state.sessionConfig = data?.session_config || {};
+      if (!state.openingQuestion) {
+        state.openingQuestion = data?.session_config?.opening_question || null;
+      }
     } catch (e) {}
   }
 
@@ -321,16 +473,14 @@ async function ensureConnection(sessionId, participantName) {
       try { connection.keepAlive(); } catch (e) {}
     }, 8000);
 
-    // Start analysis loop on first connection for this session only
+    // Start analysis loop on first connection
     const allKeys = [...activeConnections.keys()].filter(k => k.startsWith(sessionId + '::'));
     if (allKeys.length === 1) {
-      const state = getSessionState(sessionId);
-      state.analysisInterval = setInterval(() => {
-        analyseAndPrompt(sessionId).catch(err =>
-          console.error('[Prompt Engine] Interval error:', err.message)
-        );
+      const s = getSessionState(sessionId);
+      s.analysisInterval = setInterval(() => {
+        runAnalysis(sessionId);
       }, 30000);
-      console.log(`[Prompt Engine] Analysis loop started for session ${sessionId}`);
+      console.log(`[Analysis] Loop started for session ${sessionId}`);
     }
   });
 
@@ -342,42 +492,42 @@ async function ensureConnection(sessionId, participantName) {
     const utterance = alt.transcript.trim();
     if (utterance.split(' ').length < 3) return;
 
-    const speakerTag = participantName;
     const { getParticipantSNR } = require('./websocket');
     const currentSNR = getParticipantSNR ? getParticipantSNR(sessionId, participantName) : 1.0;
-
     if (isDuplicate(sessionId, participantName, utterance, currentSNR)) return;
 
-    console.log(`[Deepgram] Transcript: ${speakerTag} - ${utterance}`);
+    console.log(`[Deepgram] Transcript: ${participantName} - ${utterance}`);
 
     await supabase.from('transcripts').insert({
-      session_id: sessionId,
-      speaker_name: speakerTag,
-      utterance,
-      timestamp_seconds: 0,
+      session_id: sessionId, speaker_name: participantName,
+      utterance, timestamp_seconds: 0,
     });
 
     const state = getSessionState(sessionId);
-    if (!state.participantStats[speakerTag]) {
-      state.participantStats[speakerTag] = { talkTimeSeconds: 0, utteranceCount: 0 };
+    if (!state.participantStats[participantName]) {
+      state.participantStats[participantName] = { talkTimeSeconds: 0, utteranceCount: 0 };
     }
-    state.participantStats[speakerTag].utteranceCount += 1;
-    state.participantStats[speakerTag].talkTimeSeconds += utterance.split(' ').length * 0.4;
+    state.participantStats[participantName].utteranceCount += 1;
+    state.participantStats[participantName].talkTimeSeconds += utterance.split(' ').length * 0.4;
 
-    state.recentTranscript.push({ speaker: speakerTag, text: utterance, timestamp: Date.now() });
+    state.recentTranscript.push({ speaker: participantName, text: utterance, timestamp: Date.now() });
     if (state.recentTranscript.length > 40) state.recentTranscript.shift();
+
+    // Update per-student last spoke time
+    const stu = getStudentState(state, participantName);
+    stu.lastSpokeAt = Date.now();
 
     const { broadcastToAdmins } = require('./websocket');
     broadcastToAdmins(sessionId, 'NEW_UTTERANCE', {
-      speakerTag, utterance, timestamp: new Date().toISOString(),
+      speakerTag: participantName, utterance, timestamp: new Date().toISOString(),
     });
 
-    if (!state.utteranceBuffer[speakerTag]) state.utteranceBuffer[speakerTag] = [];
-    state.utteranceBuffer[speakerTag].push(utterance);
-    if (state.utteranceBuffer[speakerTag].length >= 3) {
-      const batch = state.utteranceBuffer[speakerTag].join(' ');
-      state.utteranceBuffer[speakerTag] = [];
-      scoreAndBroadcast(sessionId, state, speakerTag, batch);
+    if (!state.utteranceBuffer[participantName]) state.utteranceBuffer[participantName] = [];
+    state.utteranceBuffer[participantName].push(utterance);
+    if (state.utteranceBuffer[participantName].length >= 3) {
+      const batch = state.utteranceBuffer[participantName].join(' ');
+      state.utteranceBuffer[participantName] = [];
+      scoreAndBroadcast(sessionId, state, participantName, batch);
     }
   });
 
@@ -401,6 +551,25 @@ async function scoreAndBroadcast(sessionId, state, speakerTag, batch) {
     const { broadcastToAdmins } = require('./websocket');
     const scoreResult = await scoreUtterance(sessionId, speakerTag, batch, state.topic, state.sessionConfig);
     if (!scoreResult) return;
+
+    // Update per-student score tracking for nudge conditions
+    const stu = getStudentState(state, speakerTag);
+    const overallScore = scoreResult.scores?.overall_score;
+    const topicScore = scoreResult.scores?.topic_adherence;
+
+    if (overallScore != null) {
+      stu.recentBatchScores.push(overallScore);
+      if (stu.recentBatchScores.length > 3) stu.recentBatchScores.shift();
+      // Track shallow batches: REMEMBER or UNDERSTAND Bloom, or low overall score
+      const isShallow = ['REMEMBER', 'UNDERSTAND'].includes(scoreResult.bloom_level) || overallScore < 4;
+      stu.consecutiveShallowBatches = isShallow ? stu.consecutiveShallowBatches + 1 : 0;
+    }
+
+    if (topicScore != null) {
+      stu.recentTopicScores.push(topicScore);
+      if (stu.recentTopicScores.length > 3) stu.recentTopicScores.shift();
+    }
+
     await updateParticipantScore(sessionId, speakerTag, scoreResult);
     broadcastToAdmins(sessionId, 'SCORE_UPDATE', {
       speakerTag, scores: scoreResult.scores,
@@ -427,8 +596,7 @@ async function updateParticipantScore(sessionId, speakerTag, scoreResult) {
         depth: avg(existing.depth, scores.depth),
         material_application: avg(existing.material_application, scores.material_application),
         overall_score: avg(existing.overall_score, scores.overall_score),
-        bloom_level: bloomLevel,
-        utterance_count: n + 1,
+        bloom_level: bloomLevel, utterance_count: n + 1,
       }).eq('id', existing.id);
     } else {
       await supabase.from('scores').insert({
@@ -448,8 +616,8 @@ async function sendAudioChunk(sessionId, chunk, participantName) {
   if (!participantName || participantName === 'unknown') return;
   try {
     const connData = await ensureConnection(sessionId, participantName);
-    if (connData.isOpen) { connData.connection.send(chunk); }
-    else { connData.buffer.push(chunk); }
+    if (connData.isOpen) connData.connection.send(chunk);
+    else connData.buffer.push(chunk);
   } catch (err) {
     console.error(`[Audio] Chunk error for ${participantName}:`, err.message);
   }
@@ -457,15 +625,10 @@ async function sendAudioChunk(sessionId, chunk, participantName) {
 
 async function stopTranscription(sessionId) {
   console.log(`[Transcription] Stopping all connections for session ${sessionId}`);
-  const keysToClose = [...activeConnections.keys()].filter(k => k.startsWith(sessionId + '::'));
-
-  // Stop analysis interval
   const state = sessionState.get(sessionId);
-  if (state?.analysisInterval) {
-    clearInterval(state.analysisInterval);
-    state.analysisInterval = null;
-  }
+  if (state?.analysisInterval) { clearInterval(state.analysisInterval); state.analysisInterval = null; }
 
+  const keysToClose = [...activeConnections.keys()].filter(k => k.startsWith(sessionId + '::'));
   for (const key of keysToClose) {
     const connData = activeConnections.get(key);
     if (!connData) continue;
@@ -490,18 +653,33 @@ function startTranscription(sessionId, topic, sessionConfig) {
   console.log(`[Transcription] Session ${sessionId} ready`);
   const state = getSessionState(sessionId);
   if (topic) state.topic = topic;
-  if (sessionConfig) state.sessionConfig = sessionConfig;
-  // No timer scheduling here — analysis loop starts when first participant connects
+  if (sessionConfig) {
+    state.sessionConfig = sessionConfig;
+    state.openingQuestion = sessionConfig.opening_question || null;
+  }
+  state.sessionStartedAt = Date.now();
+  // Analysis loop starts when first participant connects (ensureConnection)
 }
 
 function getSessionStats(sessionId) {
-  const state = sessionState.get(sessionId);
-  return state?.participantStats || {};
+  return sessionState.get(sessionId)?.participantStats || {};
 }
 
 function getInterventionLog(sessionId) {
-  const state = sessionState.get(sessionId);
-  return state?.firedPrompts || [];
+  return sessionState.get(sessionId)?.firedPrompts || [];
 }
 
-module.exports = { sendAudioChunk, startTranscription, stopTranscription, getSessionStats, getInterventionLog };
+// Called by websocket.js when a late-joining participant connects
+function getSessionInfo(sessionId) {
+  const state = sessionState.get(sessionId);
+  if (!state || !state.sessionStartedAt) return null;
+  return {
+    openingQuestion: state.openingQuestion,
+    topic: state.topic,
+  };
+}
+
+module.exports = {
+  sendAudioChunk, startTranscription, stopTranscription,
+  getSessionStats, getInterventionLog, getSessionInfo,
+};
